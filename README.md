@@ -204,7 +204,8 @@ someone who should see pool health but never spend it.
 Serve mode exposes `/usage`:
 
 - **HTML** (htmx, auto-refreshes every 2s): accounts with request counts, 429s,
-  cooldown state, sticky pin per client, and the last-seen
+  cooldown state, sticky pin per client, real utilization from Anthropic's
+  usage API, and the last-seen
   `anthropic-ratelimit-*` values from upstream — e.g.
   `blocked · req 0/50 · tok 38.0k/40.0k · reset req 2m0s/tok 32m0s`.
 - **JSON**: `GET /usage?format=json` for scripts and alerting.
@@ -220,11 +221,29 @@ can't set headers — `GET /usage?token=cp_…` (the token stays in the URL, so
 prefer a dashboard-scoped token for this). Tokens without the `usage` scope
 get `403 permission_error`.
 
-Rate limits come from two places: response headers cproxy already sees as the
-proxy (`anthropic-ratelimit-requests-*`, `anthropic-ratelimit-tokens-*`,
-`anthropic-ratelimit-unified-status`), and cproxy's own counters
-(requests/429s/errors/sticky pins per account and client). Upstream tokens are
-always masked in dashboard and JSON output.
+Usage comes from two mechanisms, and the first is preferred whenever the
+token can answer it:
+
+1. **Real usage API** (preferred): cproxy polls
+   `GET /api/oauth/usage` in the background — lazily, starting with the first
+   usage view — and shows per-account 5-hour and 7-day utilization
+   (`5h 42.5% (resets 1h30m) · 7d 12%`), spend with its monthly limit
+   (`spend USD 25.5/500`) and per-model weekly limits (`Fable 20%`), as
+   `usage_api` in the JSON. This needs the `user:profile` scope — which
+   `cproxy setup-token` mints by default. Tokens that cannot query it (an
+   inference-only token, a revoked one) show a note like
+   `usage API: 403 (token needs the user:profile scope)` instead, and back off
+   instead of retrying. API-key accounts are not polled.
+2. **Rate-limit headers** (labeled fallback): the
+   `anthropic-ratelimit-requests-*`, `anthropic-ratelimit-tokens-*` and
+   `anthropic-ratelimit-unified-status` headers cproxy already sees as the
+   proxy, which keep request/token granularity even when the usage API is
+   unavailable.
+
+Both are shown side by side (usage API numbers in the `usage` column, inferred
+rate limits in `rate limits`), plus cproxy's own counters (requests/429s/errors/
+sticky pins per account and client). Upstream tokens are always masked in
+dashboard and JSON output.
 
 ## setup-token
 

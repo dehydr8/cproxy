@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -62,6 +63,12 @@ type Server struct {
 	log      *slog.Logger
 	maxBody  int64
 	started  time.Time // for the usage dashboard's uptime
+
+	usage     *usagePoller // real usage API cache (preferred usage source)
+	usageStop chan struct{}
+	usageWarm chan struct{} // closed after the poller's first cycle
+	usageOnce sync.Once
+	closeOnce sync.Once
 }
 
 // New builds a proxy server from opts.
@@ -97,6 +104,11 @@ func New(opts Options) *Server {
 		log:      opts.Log,
 		maxBody:  opts.MaxBody,
 		started:  time.Now(),
+		usage: &usagePoller{
+			entries: map[string]*usageEntry{},
+		},
+		usageStop: make(chan struct{}),
+		usageWarm: make(chan struct{}),
 	}
 	s.state.Store(opts.State)
 	return s

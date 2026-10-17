@@ -131,6 +131,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		httpSrv.Shutdown(ctx)
+		srv.Close()
 	}()
 
 	if scheme == "https" {

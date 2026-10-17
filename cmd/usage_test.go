@@ -23,10 +23,14 @@ func cannedSnapshot(now time.Time) string {
   "accounts": [
     {"name": "alt", "type": "oauth", "pools": ["default"], "token": "sk-***",
      "requests": 3, "rate_limited": 1, "rejected": 0, "errors": 0,
-     "state": "cooling", "cooling_until": %q},
+     "state": "cooling", "cooling_until": %q,
+     "usage_api_error": "usage API: 403 (token needs the user:profile scope)"},
     {"name": "main", "type": "oauth", "pools": ["default"], "token": "sk-***",
      "requests": 142, "rate_limited": 0, "rejected": 0, "errors": 1,
      "state": "ok", "last_used": %q,
+     "usage_api": {"five_hour": {"pct": 42.5}, "seven_day": {"pct": 12},
+       "spend": {"used": 25.5, "limit": 500, "currency": "USD"},
+       "scoped": [{"name": "Fable", "pct": 20}]},
      "rate_limits": {"status": "allowed", "requests_limit": 50,
        "requests_remaining": 38, "requests_reset": %q}}
   ],
@@ -67,7 +71,9 @@ func TestRunUsageCmd(t *testing.T) {
 	if gotPath != "/usage?format=json" {
 		t.Fatalf("requested %q", gotPath)
 	}
-	for _, want := range []string{"main", "142", "cooling", "amp", "req 38/50"} {
+	for _, want := range []string{"main", "142", "cooling", "amp", "req 38/50",
+		"5h 42.5%", "7d 12%", "spend USD 25.5/500", "Fable 20%",
+		"usage API: 403 (token needs the user:profile scope)"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}

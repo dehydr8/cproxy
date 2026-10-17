@@ -31,6 +31,7 @@ type accountRow struct {
 	Errors      int64
 	State       string // ok / cooling … / invalid token / disabled
 	StateClass  string // CSS class for the state cell
+	UsageAPI    string // real usage API numbers, preferred over the headers
 	RateLimits  string // last anthropic-ratelimit-* headers, humanized
 	LastUsed    string
 }
@@ -62,15 +63,16 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
 <table>
   <thead><tr><th>account</th><th>type</th><th>pools</th><th>token</th>
     <th>requests</th><th>429s</th><th>errors</th><th>rejected</th>
-    <th>state</th><th>rate limits</th><th>last used</th></tr></thead>
+    <th>state</th><th>usage</th><th>rate limits</th><th>last used</th></tr></thead>
   <tbody>
   {{range .Accounts}}
     <tr><td>{{.Name}}</td><td>{{.Type}}</td><td>{{.Pools}}</td><td>{{.Token}}</td>
       <td class="num">{{.Requests}}</td><td class="num">{{.RateLimited}}</td>
       <td class="num">{{.Errors}}</td><td class="num">{{.Rejected}}</td>
-      <td class="{{.StateClass}}">{{.State}}</td><td class="rl">{{.RateLimits}}</td><td>{{.LastUsed}}</td></tr>
+      <td class="{{.StateClass}}">{{.State}}</td><td class="ua">{{.UsageAPI}}</td>
+      <td class="rl">{{.RateLimits}}</td><td>{{.LastUsed}}</td></tr>
   {{else}}
-    <tr><td colspan="11">no accounts configured</td></tr>
+    <tr><td colspan="12">no accounts configured</td></tr>
   {{end}}
   </tbody>
 </table>
@@ -106,6 +108,7 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
   table { border-collapse: collapse; margin-bottom: 2rem; width: 100%; }
   th, td { text-align: left; padding: .45rem .8rem; border-bottom: 1px solid #1f2630; white-space: nowrap; }
   td.rl { white-space: normal; min-width: 15rem; max-width: 22rem; }
+  td.ua { white-space: normal; min-width: 12rem; max-width: 20rem; }
   th { color: #8896a6; font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; font-weight: 500; }
   td.num { text-align: right; font-variant-numeric: tabular-nums; }
   td.invalid, td.cooling { color: #e6b455; }
@@ -129,6 +132,7 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
 // serveUsage renders the dashboard: the full page, the stats-only fragment
 // (?fragment=1, for htmx polling) or machine-readable JSON (?format=json).
 func (s *Server) serveUsage(w http.ResponseWriter, r *http.Request, st *State) {
+	s.ensureUsageWarm() // start the usage-API poller and let its first cycle land
 	if r.URL.Query().Get("format") == "json" {
 		s.serveUsageJSON(w, st)
 		return
@@ -177,6 +181,7 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 
 	for _, a := range accounts {
 		stt := stats[a.Name]
+		apiData, apiErr := s.usage.snapshot(a.Name)
 		state, class := "ok", "ok"
 		switch {
 		case a.Disabled:
@@ -197,6 +202,7 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 			Errors:      stt.Errors,
 			State:       state,
 			StateClass:  class,
+			UsageAPI:    UsageAPISummary(apiData, apiErr, now),
 			RateLimits:  RateLimitsSummary(stt.RateLimits, now),
 			LastUsed:    ago(stt.LastUsed),
 		})
@@ -239,7 +245,9 @@ type UsageAccount struct {
 	State        string              `json:"state"`
 	LastUsed     *time.Time          `json:"last_used,omitempty"`
 	CoolingUntil *time.Time          `json:"cooling_until,omitempty"`
-	RateLimits   *pool.RateLimitInfo `json:"rate_limits,omitempty"`
+	UsageAPI     *UsageAPI           `json:"usage_api,omitempty"`       // preferred: real usage API
+	UsageAPIErr  string              `json:"usage_api_error,omitempty"` // why the usage API is unavailable
+	RateLimits   *pool.RateLimitInfo `json:"rate_limits,omitempty"`     // fallback: inferred from headers
 	Invalid      bool                `json:"invalid,omitempty"`
 	Disabled     bool                `json:"disabled,omitempty"`
 }
@@ -279,6 +287,7 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 
 	for _, a := range accounts {
 		stt := stats[a.Name]
+		apiData, apiErr := s.usage.snapshot(a.Name)
 		state := "ok"
 		switch {
 		case a.Disabled:
@@ -302,6 +311,8 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 			Rejected:    stt.Rejected,
 			Errors:      stt.Errors,
 			State:       state,
+			UsageAPI:    apiData,
+			UsageAPIErr: apiErr,
 			RateLimits:  stt.RateLimits,
 			Invalid:     stt.Invalid,
 			Disabled:    a.Disabled,

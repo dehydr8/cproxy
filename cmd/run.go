@@ -142,6 +142,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	httpSrv.Shutdown(shutCtx)
+	srv.Close()
 
 	if err != nil {
 		return err

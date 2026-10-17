@@ -27,9 +27,11 @@ var usageCmd = &cobra.Command{
 	Short: "Show live usage of a running cproxy",
 	Long: `Print the live usage of a running cproxy serve instance
 (127.0.0.1:7788 by default; $CPROXY_PORT or --port) in the terminal: pool
-accounts with request counts, rate-limit state and the last
-anthropic-ratelimit-* headers cproxy observed upstream, and clients with
-their sticky pins. --json prints the raw dashboard JSON instead.
+accounts with request counts, rate-limit state, real usage numbers from
+Anthropic's usage API (tokens with the user:profile scope; preferred) and
+the last anthropic-ratelimit-* headers cproxy observed upstream (the
+labeled fallback), and clients with their sticky pins. --json prints the
+raw dashboard JSON instead.
 
 The instance is whatever ` + "`cproxy serve`" + ` or the claude wrapper started. A
 one-shot ` + "`cproxy run`" + ` session keeps its port and its session token to
@@ -165,11 +167,13 @@ func renderUsage(out io.Writer, snap proxy.UsageSnapshot, addr string, now time.
 		snap.Version, addr, snap.Upstream, humanDur(time.Duration(snap.UptimeSeconds*float64(time.Second))))
 
 	fmt.Fprintf(w, "\naccounts\t\n")
-	fmt.Fprintf(w, "  name\tstate\treq\t429\terr\tlast used\trate limits\n")
+	fmt.Fprintf(w, "  name\tstate\treq\t429\terr\tlast used\tusage\trate limits\n")
 	for _, a := range snap.Accounts {
-		fmt.Fprintf(w, "  %s\t%s\t%d\t%d\t%d\t%s\t%s\n",
+		fmt.Fprintf(w, "  %s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\n",
 			a.Name, accountState(a, now), a.Requests, a.RateLimited, a.Errors,
-			agoString(a.LastUsed, now), proxy.RateLimitsSummary(a.RateLimits, now))
+			agoString(a.LastUsed, now),
+			proxy.UsageAPISummary(a.UsageAPI, a.UsageAPIErr, now),
+			proxy.RateLimitsSummary(a.RateLimits, now))
 	}
 
 	fmt.Fprintf(w, "\nclients\t\n")
