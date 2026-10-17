@@ -1,0 +1,6 @@
+/cproxy
+/cproxy.exe
+*.test
+*.out
+dist/
+.DS_Store
