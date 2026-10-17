@@ -16,11 +16,13 @@ import (
 
 // Environment variables understood by cproxy.
 const (
-	EnvHome         = "CPROXY_HOME"          // overrides ~/.cproxy
-	EnvTokens       = "CPROXY_TOKENS"        // name:token,… → default pool
-	EnvPoolPrefix   = "CPROXY_POOL_TOKENS_"  // + POOLNAME → that pool
-	EnvClientTokens = "CPROXY_CLIENT_TOKENS" // name:token,… serve-mode client auth
-	EnvUpstreamName = "CPROXY_UPSTREAM"      // upstream base URL override
+	EnvHome          = "CPROXY_HOME"          // overrides ~/.cproxy
+	EnvTokens        = "CPROXY_TOKENS"        // name:token,… → default pool
+	EnvPoolPrefix    = "CPROXY_POOL_TOKENS_"  // + POOLNAME → that pool
+	EnvClientTokens  = "CPROXY_CLIENT_TOKENS" // name:token,… serve-mode client auth
+	EnvUpstreamName  = "CPROXY_UPSTREAM"      // upstream base URL override
+	EnvAuthTokenName = "CPROXY_AUTH_TOKEN"    // client token the claude wrapper presents
+	EnvPortName      = "CPROXY_PORT"          // port of the wrapper's shared serve instance
 )
 
 // DefaultUpstream is the Anthropic API base URL used unless overridden.

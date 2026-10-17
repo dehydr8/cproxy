@@ -28,7 +28,17 @@ Failover:
 
 ## Install
 
-Requires Go 1.24+:
+Prebuilt binaries for linux/amd64 are attached to every
+[release](https://github.com/dehydr8/cproxy/releases) — a versionless
+`cproxy-linux-amd64.tar.gz` keeps a stable latest-download URL:
+
+```sh
+curl -fsSL https://github.com/dehydr8/cproxy/releases/latest/download/cproxy-linux-amd64.tar.gz \
+  | tar xz -C /tmp
+install -m 755 /tmp/cproxy ~/.local/bin/cproxy
+```
+
+or with Go 1.24+:
 
 ```sh
 go install github.com/dehydr8/cproxy@latest
@@ -57,6 +67,39 @@ cproxy run --pool cvp -- claude
 pool is the only thing the child can use. The child shares cproxy's process
 group (Ctrl+C reaches it directly), and cproxy exits with the child's exit
 code.
+
+## Wrapping the claude command (`cproxy install`)
+
+`cproxy run` only covers launches you make yourself. `cproxy install` makes
+**every** `claude` launch go through cproxy, whatever started it — your
+shell, a script, or Amp's Claude Code mode:
+
+```sh
+cproxy install          # wrap claude; `cproxy uninstall` restores it
+```
+
+The real binary is moved to `claude.cproxy-real` beside itself and a tiny
+shim takes its place. The shim holds no secrets and makes no decisions; it
+just execs `cproxy claude --exec <real binary>`, which on every launch:
+
+1. picks the client token claude will present: `$CPROXY_AUTH_TOKEN`, a
+   matching `$ANTHROPIC_AUTH_TOKEN`, or the first proxy-scoped client token
+   in `$CPROXY_CLIENT_TOKENS` / `credentials.json`;
+2. starts a shared `cproxy serve` on `127.0.0.1:7788` (`$CPROXY_PORT`) if
+   nothing is listening there yet — inheriting the current environment, so
+   env-configured credentials just work — logging to `~/.cproxy/serve.log`;
+3. launches the real claude with `ANTHROPIC_BASE_URL` /
+   `ANTHROPIC_AUTH_TOKEN` pointed at it (and `CPROXY_*` secrets stripped).
+
+It backs off — running claude completely untouched — when there is nothing
+to inject: no configured credentials, or an `ANTHROPIC_BASE_URL` /
+`ANTHROPIC_AUTH_TOKEN` the environment already carries (whoever set them
+wins). A configured client token with no pool accounts to serve it is an
+error, surfaced loudly rather than silently routing wrong.
+
+Claude Code's self-updater replaces its binary, which overwrites the shim —
+re-run `cproxy install` after updates. Both `install` and `uninstall`
+accept `--path` for a binary that is not on PATH.
 
 ## Credentials
 
@@ -113,6 +156,9 @@ Env entries override same-named file entries; flags override both.
 | --- | --- |
 | `cproxy run [--pool P] [-- cmd…]` | start a local proxy and launch `cmd` (default `claude`) through it |
 | `cproxy serve [--addr :7788]` | run as a shared server with client-token auth |
+| `cproxy install [--path P]` | replace the `claude` binary with the cproxy shim (undo: `cproxy uninstall`) |
+| `cproxy claude [--port N] [-- cmd…]` | run the real claude through the shared local serve (what the shim execs) |
+| `cproxy usage [--port N] [--json]` | print live usage of a running serve instance in the terminal |
 | `cproxy setup-token` | mint a long-lived Anthropic OAuth token via browser sign-in |
 | `cproxy accounts add/disable/enable/remove/list` | manage pool accounts in `credentials.json` |
 | `cproxy pools` | list pools, strategies and members |
@@ -132,7 +178,9 @@ export ANTHROPIC_AUTH_TOKEN=cp_…    # their cproxy client token
 Client tokens are registered with `--client-tokens alice:cp_…`,
 `CPROXY_CLIENT_TOKENS=alice:cp_…,monitor:cp_…:usage`, or the
 `client_tokens` map in `credentials.json`, and never travel upstream — cproxy
-replaces the `Authorization` header with a pool account's credential.
+replaces the `Authorization` header with a pool account's credential. Nothing
+is ever written back: `credentials.json` (or the env) is the only token store;
+`cproxy token` mints and prints one, you put it where you want it.
 
 - Send `SIGHUP` to reload `credentials.json` without dropping connections
   (accounts whose tokens changed lose their sticky assignments and cooldowns).
@@ -161,6 +209,11 @@ Serve mode exposes `/usage`:
   `blocked · req 0/50 · tok 38.0k/40.0k · reset req 2m0s/tok 32m0s`.
 - **JSON**: `GET /usage?format=json` for scripts and alerting.
 - **Fragment**: `GET /usage?fragment=1` returns just the stats tables.
+- **Terminal**: `cproxy usage [--port N] [--json]` prints the live table in a
+  shell, authenticating with a client token from the same places serve reads
+  them (env or `credentials.json`); it needs the `usage` scope. Only a shared
+  serve instance (serve, or the wrapper's spawned one) can be queried — a
+  one-shot `cproxy run` session keeps its port and session token to itself.
 
 Auth is a client token via the `Authorization` header, or — since browsers
 can't set headers — `GET /usage?token=cp_…` (the token stays in the URL, so
@@ -192,23 +245,51 @@ treat them like passwords.
 
 ## Using it inside Amp
 
-Amp threads can run in **Claude Code mode**, and Claude Code decides where to
-send requests from `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`. cproxy fits
-that seam, and can be configured entirely through env vars so no credentials
-file is needed:
+Amp threads can run in **Claude Code mode**. The wiring lives entirely in
+the `claude` wrapper — nothing is added to `.agents/setup`,
+`.agents/resume`, or `.amp/services.yaml`, so the repository stays clean
+and machines without cproxy behave exactly as before.
 
-1. Run `cproxy serve` somewhere the orb can reach (your own host, or inside
-   the orb itself via `.agents/setup` / `.amp/services.yaml`).
+1. Install cproxy in the orb and wrap `claude` (the post-install script
+   below does both).
 2. In the Amp project's **Settings → Secrets & Env Vars**, add:
-   - `ANTHROPIC_BASE_URL` → your cproxy serve URL
-   - `ANTHROPIC_AUTH_TOKEN` → a cproxy client token
-   - plus the env config for cproxy itself if it runs in the orb
-     (`CPROXY_TOKENS` / `CPROXY_POOL_TOKENS_<NAME>` / `CPROXY_CLIENT_TOKENS`)
-3. Claude Code in the orb then routes through cproxy: each Amp thread gets a
-   stable client identity, sticks to one account, and fails over on 429.
+   - `CPROXY_TOKENS` (or `CPROXY_POOL_TOKENS_<NAME>`) — the pooled account
+     tokens, marked as secrets;
+   - `CPROXY_CLIENT_TOKENS` — e.g. `amp:cp_…` for Claude Code, plus
+     `monitor:cp_…:usage` for a dashboard-only viewer.
+3. The first `claude` launch in an orb starts serve on `127.0.0.1:7788`
+   (inheriting those env vars), injects the routing into claude, and
+   registers the `/usage` dashboard as an orb portal. Each Amp thread gets
+   a stable client identity, sticks to one account, and fails over on 429.
 
-Keep the tokens marked as secrets in Amp so they stay hidden; give
-dashboard-only viewers a `usage`-scoped client token.
+If the vars are absent the shim injects nothing, so the same setup works
+with or without cproxy. Clients that never launch the `claude` binary point
+at a shared `cproxy serve` with `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
+instead (the wrapper sees those and stays out of the way).
+
+### Amp post-install script
+
+Amp runs a project pre-setup script in every orb before agent work starts
+(project **Settings → Pre-setup script**). This one installs cproxy and
+wraps `claude` — the post-install step for Claude Code's binary:
+
+```sh
+#!/bin/sh
+set -eu
+if ! command -v cproxy >/dev/null 2>&1; then
+  mkdir -p "$HOME/.local/bin"
+  curl -fsSL https://github.com/dehydr8/cproxy/releases/latest/download/cproxy-linux-amd64.tar.gz \
+    | tar xz -C /tmp
+  install -m 755 /tmp/cproxy "$HOME/.local/bin/cproxy"
+fi
+cproxy install
+```
+
+It leaves no credentials behind — `cproxy install` only swaps in the shim;
+credentials arrive per-thread through the project env vars above (or a
+`credentials.json` under `$CPROXY_HOME`, which works too). The script needs
+the `claude` binary to exist; if Claude Code is installed after it runs,
+re-run `cproxy install` once.
 
 ## Security notes
 
@@ -228,4 +309,5 @@ go build ./... && go vet ./... && go test ./...
 
 Layout: `cmd/` (cobra commands), `internal/config` (file + env config),
 `internal/pool` (strategies, cooldowns, stats), `internal/proxy` (handler,
-failover, usage dashboard), `internal/launch` (child process launching).
+failover, usage dashboard), `internal/launch` (child process launching),
+`internal/wrap` (claude shim install + shared-serve bootstrap).

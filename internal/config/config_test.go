@@ -337,3 +337,45 @@ func TestClientTokenScopes(t *testing.T) {
 		t.Fatalf("scope roundtrip = %s, %+v, %v", b, back, err)
 	}
 }
+
+func TestClientTokenListOrder(t *testing.T) {
+	got := ClientTokenList("monitor:cp_m:usage,amp:cp_a,bare:cp_b:proxy+usage")
+	want := []NamedClientToken{
+		{Name: "monitor", Spec: ClientTokenSpec{Token: "cp_m", Scopes: []string{"usage"}}},
+		{Name: "amp", Spec: ClientTokenSpec{Token: "cp_a"}},
+		{Name: "bare", Spec: ClientTokenSpec{Token: "cp_b", Scopes: []string{"proxy", "usage"}}},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ClientTokenList = %+v, want %+v", got, want)
+	}
+	for i := range want {
+		if got[i].Name != want[i].Name || got[i].Spec.Token != want[i].Spec.Token ||
+			strings.Join(got[i].Spec.Scopes, "+") != strings.Join(want[i].Spec.Scopes, "+") {
+			t.Fatalf("entry %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+	if len(ClientTokenList("nope:")) != 0 {
+		t.Fatal("empty tokens accepted")
+	}
+}
+
+func TestEnvHelpers(t *testing.T) {
+	env := []string{
+		EnvClientTokens + "=amp:cp_a,monitor:cp_m:usage",
+		EnvAuthTokenName + "=cp_x",
+		EnvPortName + "=7790",
+		"OTHER=1",
+	}
+	if got := EnvClientTokenList(env); len(got) != 2 || got[0].Name != "amp" || got[1].Name != "monitor" {
+		t.Fatalf("EnvClientTokenList = %+v, want amp then monitor", got)
+	}
+	if got := EnvClientTokenList(nil); got != nil {
+		t.Fatalf("EnvClientTokenList(nil) = %+v", got)
+	}
+	if got := EnvAuthToken(env); got != "cp_x" {
+		t.Fatalf("EnvAuthToken = %q", got)
+	}
+	if got := EnvPort(env); got != "7790" {
+		t.Fatalf("EnvPort = %q", got)
+	}
+}

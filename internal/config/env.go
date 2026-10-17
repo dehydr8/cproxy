@@ -112,13 +112,17 @@ func envClientTokens(environ []string) map[string]ClientTokenSpec {
 	return nil
 }
 
-// ClientTokensFromList parses a "name:token[:scopes],…" list (as used by
-// --client-tokens and CPROXY_CLIENT_TOKENS) into named specs. Entries
-// without a name get generated names. The optional third field lists the
-// token's scopes, "+"-separated (e.g. "monitor:cp_…:usage" or
-// "alice:cp_…:proxy+usage"); without it the token gets full access.
-func ClientTokensFromList(list string) map[string]ClientTokenSpec {
-	specs := map[string]ClientTokenSpec{}
+// NamedClientToken is a client token together with the name it was
+// configured under. ClientTokensFromList returns a map and loses the list
+// order; the claude wrapper needs it to pick "the first token".
+type NamedClientToken struct {
+	Name string
+	Spec ClientTokenSpec
+}
+
+// ClientTokenList parses a "name:token[:scopes],…" list IN ORDER.
+func ClientTokenList(list string) []NamedClientToken {
+	var out []NamedClientToken
 	for _, e := range parseTokenList(list, "client") {
 		spec := ClientTokenSpec{Token: e.Token}
 		if tok, scopes, ok := strings.Cut(e.Token, ":"); ok {
@@ -132,9 +136,39 @@ func ClientTokensFromList(list string) map[string]ClientTokenSpec {
 		if spec.Token == "" {
 			continue
 		}
-		specs[e.Name] = spec
+		out = append(out, NamedClientToken{Name: e.Name, Spec: spec})
 	}
-	return specs
+	return out
+}
+
+// EnvClientTokenList returns the CPROXY_CLIENT_TOKENS entries in list order.
+func EnvClientTokenList(environ []string) []NamedClientToken {
+	for _, kv := range environ {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == EnvClientTokens && v != "" {
+			return ClientTokenList(v)
+		}
+	}
+	return nil
+}
+
+// EnvAuthToken returns CPROXY_AUTH_TOKEN from environ, or "".
+func EnvAuthToken(environ []string) string {
+	for _, kv := range environ {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == EnvAuthTokenName && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// EnvPort returns CPROXY_PORT from environ, or "".
+func EnvPort(environ []string) string {
+	for _, kv := range environ {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == EnvPortName && v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // EnvUpstream returns CPROXY_UPSTREAM from environ, or "".
@@ -145,4 +179,17 @@ func EnvUpstream(environ []string) string {
 		}
 	}
 	return ""
+}
+
+// ClientTokensFromList parses a "name:token[:scopes],…" list (as used by
+// --client-tokens and CPROXY_CLIENT_TOKENS) into named specs. Entries
+// without a name get generated names. The optional third field lists the
+// token's scopes, "+"-separated (e.g. "monitor:cp_…:usage" or
+// "alice:cp_…:proxy+usage"); without it the token gets full access.
+func ClientTokensFromList(list string) map[string]ClientTokenSpec {
+	specs := map[string]ClientTokenSpec{}
+	for _, e := range ClientTokenList(list) {
+		specs[e.Name] = e.Spec
+	}
+	return specs
 }

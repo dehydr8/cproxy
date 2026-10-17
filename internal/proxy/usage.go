@@ -197,7 +197,7 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 			Errors:      stt.Errors,
 			State:       state,
 			StateClass:  class,
-			RateLimits:  rateLimitsCell(stt.RateLimits, now),
+			RateLimits:  RateLimitsSummary(stt.RateLimits, now),
 			LastUsed:    ago(stt.LastUsed),
 		})
 	}
@@ -217,16 +217,17 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 	return data
 }
 
-// usageJSON mirrors usageData for ?format=json consumers.
-type usageJSON struct {
-	Version       string        `json:"version"`
-	Upstream      string        `json:"upstream"`
-	UptimeSeconds float64       `json:"uptime_seconds"`
-	Accounts      []accountJSON `json:"accounts"`
-	Clients       []clientJSON  `json:"clients"`
+// UsageSnapshot is the wire shape of /usage?format=json — the same data as
+// the dashboard, for scripts and for `cproxy usage`.
+type UsageSnapshot struct {
+	Version       string         `json:"version"`
+	Upstream      string         `json:"upstream"`
+	UptimeSeconds float64        `json:"uptime_seconds"`
+	Accounts      []UsageAccount `json:"accounts"`
+	Clients       []UsageClient  `json:"clients"`
 }
 
-type accountJSON struct {
+type UsageAccount struct {
 	Name         string              `json:"name"`
 	Type         string              `json:"type"`
 	Pools        []string            `json:"pools"`
@@ -243,7 +244,7 @@ type accountJSON struct {
 	Disabled     bool                `json:"disabled,omitempty"`
 }
 
-type clientJSON struct {
+type UsageClient struct {
 	Name     string     `json:"name"`
 	Pool     string     `json:"pool"`
 	Pinned   string     `json:"pinned"`
@@ -253,12 +254,12 @@ type clientJSON struct {
 
 func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 	now := time.Now()
-	out := usageJSON{
+	out := UsageSnapshot{
 		Version:       version.String(),
 		Upstream:      s.upstream.String(),
 		UptimeSeconds: now.Sub(s.started).Seconds(),
-		Accounts:      []accountJSON{},
-		Clients:       []clientJSON{},
+		Accounts:      []UsageAccount{},
+		Clients:       []UsageClient{},
 	}
 
 	var accounts []pool.Account
@@ -291,7 +292,7 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 		if len(pools) == 0 {
 			pools = []string{config.DefaultPoolName}
 		}
-		row := accountJSON{
+		row := UsageAccount{
 			Name:        a.Name,
 			Type:        string(a.Type),
 			Pools:       pools,
@@ -315,10 +316,10 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 		}
 		out.Accounts = append(out.Accounts, row)
 	}
-	slices.SortFunc(out.Accounts, func(a, b accountJSON) int { return strings.Compare(a.Name, b.Name) })
+	slices.SortFunc(out.Accounts, func(a, b UsageAccount) int { return strings.Compare(a.Name, b.Name) })
 
 	for _, cca := range clients {
-		row := clientJSON{
+		row := UsageClient{
 			Name:     cca.Name,
 			Pool:     poolNameFor(cca),
 			Pinned:   pinnedLabel(sticky[poolNameFor(cca)+"|"+cca.Name]),
@@ -330,7 +331,7 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 		}
 		out.Clients = append(out.Clients, row)
 	}
-	slices.SortFunc(out.Clients, func(a, b clientJSON) int { return strings.Compare(a.Name, b.Name) })
+	slices.SortFunc(out.Clients, func(a, b UsageClient) int { return strings.Compare(a.Name, b.Name) })
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -357,8 +358,8 @@ func poolsLabel(pools []string) string {
 	return strings.Join(pools, ",")
 }
 
-// rateLimitsCell renders the last-seen anthropic-ratelimit-* headers.
-func rateLimitsCell(rl *pool.RateLimitInfo, now time.Time) string {
+// RateLimitsSummary renders the last-seen anthropic-ratelimit-* headers.
+func RateLimitsSummary(rl *pool.RateLimitInfo, now time.Time) string {
 	if rl == nil {
 		return "—"
 	}

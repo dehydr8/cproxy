@@ -33,6 +33,7 @@ Quick start:
 	cproxy accounts add work --pool cvp
 	cproxy run --pool cvp -- claude       # local: Claude talks to cproxy
 	cproxy serve --addr :7788            # shared: others point at you
+	cproxy install                       # or: make the claude command itself go through it
 
 By default each client sticks to one pool account and only switches when
 that account hits its limit, so a conversation pays for its full context on
@@ -44,7 +45,8 @@ exactly one subscription instead of on every member of the pool.`,
 func init() {
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false,
 		"suppress per-request logs (errors still print)")
-	rootCmd.AddCommand(runCmd, serveCmd, accountsCmd, poolsCmd, tokenCmd, setupTokenCmd, versionCmd)
+	rootCmd.AddCommand(runCmd, serveCmd, claudeCmd, installCmd, uninstallCmd,
+		usageCmd, accountsCmd, poolsCmd, tokenCmd, setupTokenCmd, versionCmd)
 }
 
 // Execute runs the CLI; errors are printed and exit non-zero.

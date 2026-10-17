@@ -4,3 +4,6 @@
 *.out
 dist/
 .DS_Store
+
+# Amp orb generated portal state
+.amp/portals/
