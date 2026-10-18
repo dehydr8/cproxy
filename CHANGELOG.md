@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0](https://github.com/dehydr8/cproxy/compare/v1.1.0...v1.2.0) (2026-10-18)
+
+
+### Features
+
+* Fly.io template and private dashboard listener for remote serve ([#6](https://github.com/dehydr8/cproxy/issues/6)) ([ca85b38](https://github.com/dehydr8/cproxy/commit/ca85b388655a6b47fa7add885915197f0a71fce5))
+
+
+### Bug Fixes
+
+* a bare 429 no longer benches accounts; subscription windows, plans, per-client env tokens ([#8](https://github.com/dehydr8/cproxy/issues/8)) ([5cecb94](https://github.com/dehydr8/cproxy/commit/5cecb94fd9cc563ecc1c745549943815fd132b77))
+
 ## [1.1.0](https://github.com/dehydr8/cproxy/compare/v1.0.0...v1.1.0) (2026-10-18)
 
 
