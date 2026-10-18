@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.6.0](https://github.com/dehydr8/cproxy/compare/v1.5.0...v1.6.0) (2026-10-18)
+
+
+### Features
+
+* one per-user local daemon for every claude; nicer usage everywhere ([#16](https://github.com/dehydr8/cproxy/issues/16)) ([487df36](https://github.com/dehydr8/cproxy/commit/487df36781e335e599b839a3a4c271a1cea71bd5))
+
+
+### Bug Fixes
+
+* quiet Claude Code's connectivity probe; say what a config sync changed ([#19](https://github.com/dehydr8/cproxy/issues/19)) ([206dd8a](https://github.com/dehydr8/cproxy/commit/206dd8ac515f5dcaa6c2c9c6c13858519dd98cb4))
+
 ## [1.5.0](https://github.com/dehydr8/cproxy/compare/v1.4.0...v1.5.0) (2026-10-18)
 
 
