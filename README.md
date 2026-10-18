@@ -475,19 +475,28 @@ set -eu
 # Only inside Amp orbs; anywhere else leave claude untouched.
 [ "${AMP_ORB:-}" = "1" ] || exit 0
 export PATH="$HOME/.local/bin:$PATH"
-if ! command -v cproxy >/dev/null 2>&1; then
+repo=https://github.com/dehydr8/cproxy
+# Install cproxy, or upgrade it when a newer release is out.
+latest=$(curl -fsSI -o /dev/null -w '%{redirect_url}' "$repo/releases/latest" | sed 's|.*/||') || latest=
+current=$(cproxy version 2>/dev/null | awk '{print $2}') || current=
+if [ -z "$current" ] || { [ -n "$latest" ] && [ "$current" != "$latest" ]; }; then
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  arch=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+  tmp=$(mktemp -d)
+  curl -fsSL "$repo/releases/latest/download/cproxy-$os-$arch.tar.gz" | tar xz -C "$tmp"
   mkdir -p "$HOME/.local/bin"
-  curl -fsSL https://github.com/dehydr8/cproxy/releases/latest/download/cproxy-linux-amd64.tar.gz \
-    | tar xz -C /tmp
-  install -m 755 /tmp/cproxy "$HOME/.local/bin/cproxy"
+  install -m 755 "$tmp/cproxy" "$HOME/.local/bin/cproxy"
+  rm -rf "$tmp"
 fi
 cproxy install
 ```
 
 It leaves no credentials behind — `cproxy install` only swaps in the shim;
 credentials arrive per-thread through the project env vars above (or a
-`credentials.json` under `$CPROXY_HOME`, which works too). Running it again
-is harmless; it reinstalls the shim after Claude Code updates.
+`credentials.json` under `$CPROXY_HOME`, which works too). It is not pinned:
+each run compares the installed cproxy with the latest release and upgrades
+when a newer one is out (keeping the installed one if GitHub is
+unreachable), then reinstalls the shim if Claude Code updated itself.
 
 ## Security notes
 
