@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/dehydr8/cproxy/compare/v1.3.0...v1.4.0) (2026-10-18)
+
+
+### Features
+
+* live requests, pinned clients and token counts on the dashboard ([#12](https://github.com/dehydr8/cproxy/issues/12)) ([2a98689](https://github.com/dehydr8/cproxy/commit/2a98689d806700ccbc1e906b2a36d0fc19e43a2d))
+
 ## [1.3.0](https://github.com/dehydr8/cproxy/compare/v1.2.0...v1.3.0) (2026-10-18)
 
 
