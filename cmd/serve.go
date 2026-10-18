@@ -89,6 +89,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	policy, err := config.SwitchPolicy(os.Environ())
+	if err != nil {
+		return err
+	}
 
 	ln, err := net.Listen("tcp", serveAddr)
 	if err != nil {
@@ -96,6 +100,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	srv := proxy.New(proxy.Options{Upstream: upstream, State: st, Log: newLogger(), HideUsage: serveUsageAddr != ""})
+	srv.Selector().SetSwitchPolicy(policy)
 	httpSrv := &http.Server{Handler: srv, ReadHeaderTimeout: 30 * time.Second}
 	log := newLogger()
 

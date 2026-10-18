@@ -411,6 +411,18 @@ func (s *Server) pollUsageOnce(ctx context.Context) {
 			data, err := fetchUsageAPI(fctx, s.client, s.upstream, a.Token)
 			cancel()
 			s.usage.record(a.Name, data, err, time.Now())
+			if data != nil {
+				// Lets proactive switching see accounts not used lately.
+				var five, seven *float64
+				var fiveReset, sevenReset *time.Time
+				if w := data.FiveHour; w != nil {
+					five, fiveReset = &w.Pct, w.ResetsAt
+				}
+				if w := data.SevenDay; w != nil {
+					seven, sevenReset = &w.Pct, w.ResetsAt
+				}
+				s.sel.MarkUsageAPI(a.Name, five, fiveReset, seven, sevenReset, data.FetchedAt)
+			}
 		}
 		if ctx.Err() == nil && s.usage.profileDue(a.Name, time.Now()) {
 			fctx, cancel := context.WithTimeout(ctx, usageAPITimeout)

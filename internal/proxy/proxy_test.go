@@ -894,17 +894,52 @@ func TestLiveRequestsAndTokens(t *testing.T) {
 
 	close(release)
 	<-done
-	doReq(t, "POST", ts.URL+"/v1/messages", aliceHeaders(), "gzip")
-	doReq(t, "POST", ts.URL+"/v1/messages", aliceHeaders(), "{}")
+	for _, body := range []string{"gzip", "{}"} {
+		io.ReadAll(doReq(t, "POST", ts.URL+"/v1/messages", aliceHeaders(), body).Body)
+	}
 
 	// After: nothing open; tokens from all three replies are counted, with
-	// the stream's final (cumulative) output count, not its first.
-	acc, cli = snapshot()
+	// the stream's final (cumulative) output count, not its first. A client
+	// can read the last byte just before the proxy's handler returns, so
+	// give the counters a moment to settle.
 	want := pool.TokenUsage{Input: 10 + 100 + 3, Output: 42 + 7 + 4, CacheRead: 1000, CacheWrite: 5}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		acc, cli = snapshot()
+		if acc.InFlight == 0 && cli.Live == 0 && acc.Tokens == want || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if acc.InFlight != 0 || cli.Live != 0 {
 		t.Fatalf("after: in_flight=%d live=%d, want 0", acc.InFlight, cli.Live)
 	}
 	if acc.Tokens != want || cli.Tokens != want {
 		t.Fatalf("tokens: account %+v, client %+v; want %+v", acc.Tokens, cli.Tokens, want)
+	}
+}
+
+func TestStickyMovesOffANearlySpentAccount(t *testing.T) {
+	up := newFakeUpstream(t, func(w http.ResponseWriter, h hit) {
+		// Real OAuth responses report the subscription windows (0–1).
+		util := map[string]string{"Bearer tokA": "0.95", "Bearer tokB": "0.10"}[h.auth]
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "allowed")
+		w.Header().Set("Anthropic-Ratelimit-Unified-5h-Utilization", util)
+		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Utilization", "0.05")
+		w.WriteHeader(200)
+	})
+	accts := []pool.Account{{Name: "a", Token: "tokA"}, {Name: "b", Token: "tokB"}}
+	clients := map[string]config.ClientAuth{"cp_alice": {Name: "alice"}}
+	ts := newProxy(t, up.URL, testRuntime(accts, clients), "", nil)
+
+	for range 3 {
+		if resp := doReq(t, "POST", ts.URL+"/v1/messages", aliceHeaders(), "{}"); resp.StatusCode != 200 {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+	}
+	// a serves first and reports 95% of its 5-hour window; from then on
+	// alice is on b, before a ever returns a 429.
+	if got := up.auths(); !slices.Equal(got, []string{"Bearer tokA", "Bearer tokB", "Bearer tokB"}) {
+		t.Fatalf("served by %v; want a once, then b", got)
 	}
 }

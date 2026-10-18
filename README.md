@@ -12,10 +12,19 @@ only files it owns live under `~/.cproxy/` (or `$CPROXY_HOME`).
 
 A Claude conversation resends its full context on every request. If a proxy
 rotated credentials per request, every account in the pool would pay for the
-whole context. cproxy pins each client to **one** pool account and only moves
-it when that account hits its limit (429) or dies (401/transport error), so a
-conversation is paid for once, on one subscription. Other strategies
-(`round-robin`, `least-used`, `random`) are available per pool.
+whole context. cproxy pins each client to **one** pool account and keeps it
+there, so a conversation is paid for once, on one subscription. Other
+strategies (`round-robin`, `least-used`, `random`) are available per pool.
+
+The pin moves **before** the account runs out, the way claude-swap's
+auto-switch does: once the account's binding window (the higher of its
+5-hour and 7-day utilization, read from every response's
+`anthropic-ratelimit-unified-*` headers and from the usage API) reaches
+**90%**, the client moves to the account with the most headroom, provided that
+one is under 90% and at least 10 points lower, at most once per 5 minutes.
+New clients start on the account with the most headroom. Set
+`CPROXY_SWITCH_AT=80` for another threshold, or `0` to only move on limits
+and errors.
 
 Failover:
 
@@ -159,6 +168,7 @@ orbs, CI, or anywhere you don't want a credentials file:
 | `CPROXY_TOKEN_<NAME>` | one account `<name>` in the default pool |
 | `CPROXY_POOL_TOKEN_<POOL>_<NAME>` | one account `<pool>-<name>` in pool `<pool>` |
 | `CPROXY_POOL` | the pool to use when `--pool` is not given (default `default`) |
+| `CPROXY_SWITCH_AT` | utilization % at which a sticky client moves to a fresher account (default 90; 0 = only on limits) |
 | `CPROXY_TOKENS` | several default-pool accounts in one variable: `name:token,name:token` |
 | `CPROXY_POOL_TOKENS_<POOL>` | several accounts for pool `<pool>`: `cvp1:tok,cvp2:tok` |
 | `CPROXY_CLIENT_TOKEN_<NAME>` | one serve-mode client token for client `<name>`: `token[:scopes]` |

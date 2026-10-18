@@ -115,6 +115,127 @@ type Selector struct {
 	clientLive  map[string]int64      // client -> requests open right now
 	tokens      map[string]TokenUsage // account -> tokens served
 	clientTok   map[string]TokenUsage // client -> tokens used
+	apiUsage    map[string]windows    // account -> last usage API utilization
+	lastSwitch  map[string]time.Time  // pool|client -> last proactive move
+	switchWhy   map[string]string     // pool|client -> why it last moved
+	policy      SwitchPolicy
+}
+
+// SwitchPolicy moves a sticky client off its account before the account's
+// limit, as claude-swap's auto-switch does: once the account's binding
+// window (the higher of its 5-hour and 7-day utilization) reaches
+// Threshold, the client moves to the account with the most headroom,
+// provided that one is itself below Threshold and at least Hysteresis
+// points lower (so two accounts near the line never ping-pong). A client
+// moves proactively at most once per Cooldown; an account that actually
+// hits its limit (429) or fails is left at once regardless.
+type SwitchPolicy struct {
+	Threshold  float64 // percent; 0 disables proactive moves
+	Hysteresis float64 // percentage points
+	Cooldown   time.Duration
+}
+
+// DefaultSwitchPolicy is claude-swap's default: move at 90%.
+var DefaultSwitchPolicy = SwitchPolicy{Threshold: 90, Hysteresis: 10, Cooldown: 5 * time.Minute}
+
+// windows is one utilization sample of an account's 5-hour and 7-day
+// windows (percent; nil when unknown).
+type windows struct {
+	fiveHour, sevenDay *float64
+	fiveReset          *time.Time
+	sevenReset         *time.Time
+	at                 time.Time
+}
+
+// binding returns the higher window, counting a window whose reset has
+// passed as empty.
+func (w windows) binding(now time.Time) (float64, bool) {
+	pct, known := 0.0, false
+	for _, win := range []struct {
+		v     *float64
+		reset *time.Time
+	}{{w.fiveHour, w.fiveReset}, {w.sevenDay, w.sevenReset}} {
+		if win.v == nil {
+			continue
+		}
+		known = true
+		if win.reset != nil && !now.Before(*win.reset) {
+			continue // the window has rolled over since
+		}
+		pct = max(pct, *win.v)
+	}
+	return pct, known
+}
+
+// SetSwitchPolicy sets how sticky clients move between accounts.
+func (s *Selector) SetSwitchPolicy(p SwitchPolicy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.policy = p
+}
+
+// MarkUsageAPI records an account's utilization from the usage API, which
+// (unlike response headers) also covers accounts not used lately.
+func (s *Selector) MarkUsageAPI(name string, fiveHour *float64, fiveReset *time.Time, sevenDay *float64, sevenReset *time.Time, at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.apiUsage[name] = windows{fiveHour, sevenDay, fiveReset, sevenReset, at}
+}
+
+// utilization returns an account's binding-window percentage from the
+// fresher of its last response headers and the usage API. The caller must
+// hold s.mu.
+func (s *Selector) utilization(name string, now time.Time) (float64, bool) {
+	var best windows
+	if rl := s.rateLimits[name]; rl != nil && (rl.FiveHourPct != nil || rl.SevenDayPct != nil) {
+		best = windows{rl.FiveHourPct, rl.SevenDayPct, rl.FiveHourReset, rl.SevenDayReset, rl.Seen}
+	}
+	if api, ok := s.apiUsage[name]; ok && api.at.After(best.at) {
+		best = api
+	}
+	return best.binding(now)
+}
+
+// mostHeadroom picks, among avail except skip, the account with the lowest
+// known utilization strictly below limit. Accounts with no utilization data
+// are taken only when no known one qualifies. The caller must hold s.mu.
+func (s *Selector) mostHeadroom(avail []Account, skip string, limit float64, now time.Time) (Account, float64, bool) {
+	var pick Account
+	pickPct, found := 0.0, false
+	var unknown []Account
+	for _, a := range avail {
+		if a.Name == skip {
+			continue
+		}
+		pct, known := s.utilization(a.Name, now)
+		if !known {
+			unknown = append(unknown, a)
+			continue
+		}
+		if pct < limit && (!found || pct < pickPct) {
+			pick, pickPct, found = a, pct, true
+		}
+	}
+	if !found && len(unknown) > 0 {
+		return unknown[0], 0, true
+	}
+	return pick, pickPct, found
+}
+
+// SwitchReason says why a client's sticky pin last moved.
+func (s *Selector) SwitchReason(poolName, clientID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r := s.switchWhy[poolName+"|"+clientID]; r != "" {
+		return r
+	}
+	return "previous account unavailable"
+}
+
+func first(a Account, avail []Account) []Account {
+	i := slices.IndexFunc(avail, func(x Account) bool { return x.Name == a.Name })
+	rest := slices.Delete(slices.Clone(avail), i, i+1)
+	return append([]Account{a}, rest...)
 }
 
 // TokenUsage counts tokens as Anthropic reports them in responses.
@@ -155,6 +276,10 @@ func NewSelector() *Selector {
 		clientLive:  map[string]int64{},
 		tokens:      map[string]TokenUsage{},
 		clientTok:   map[string]TokenUsage{},
+		apiUsage:    map[string]windows{},
+		lastSwitch:  map[string]time.Time{},
+		switchWhy:   map[string]string{},
+		policy:      DefaultSwitchPolicy,
 	}
 }
 
@@ -201,17 +326,50 @@ func (s *Selector) Ranked(members []Account, strategy Strategy, poolName, client
 
 	default: // StrategySticky
 		key := poolName + "|" + clientID
+		p := s.policy
 		if want := s.sticky[key]; want != "" {
 			if i := slices.IndexFunc(avail, func(a Account) bool { return a.Name == want }); i >= 0 {
-				rest := slices.Delete(slices.Clone(avail), i, i+1)
-				return append([]Account{avail[i]}, rest...)
+				// Move before the limit when the pinned account is nearly
+				// spent and a clearly better one exists.
+				if cur, known := s.utilization(want, now); p.Threshold > 0 && known && cur >= p.Threshold &&
+					now.Sub(s.lastSwitch[key]) >= p.Cooldown {
+					if best, pct, ok := s.mostHeadroom(avail, want, min(p.Threshold, cur-p.Hysteresis), now); ok {
+						s.sticky[key], s.lastSwitch[key] = best.Name, now
+						s.switchWhy[key] = fmt.Sprintf("%s at %.0f%% (switches at %.0f%%), %s at %.0f%%",
+							want, cur, p.Threshold, best.Name, pct)
+						return first(best, avail)
+					}
+				}
+				return first(avail[i], avail)
 			}
 			// The pinned account is unavailable; fall through and remap.
+		}
+		delete(s.switchWhy, key)
+		// New pins go to the account with the most headroom when that is
+		// known, else round-robin.
+		limit := p.Threshold
+		if limit <= 0 {
+			limit = 101
+		}
+		if best, _, ok := s.mostHeadroom(avail, "", limit, now); ok && s.anyKnown(avail, now) {
+			s.sticky[key] = best.Name
+			return first(best, avail)
 		}
 		order := s.rotate(poolName, avail)
 		s.sticky[key] = order[0].Name
 		return order
 	}
+}
+
+// anyKnown reports whether any of avail has utilization data. The caller
+// must hold s.mu.
+func (s *Selector) anyKnown(avail []Account, now time.Time) bool {
+	for _, a := range avail {
+		if _, known := s.utilization(a.Name, now); known {
+			return true
+		}
+	}
+	return false
 }
 
 // rotate advances the pool's round-robin cursor and returns members rotated
