@@ -34,6 +34,7 @@ const (
 	usageMaxBackoff  = 30 * time.Minute
 	usageForbidden   = 30 * time.Minute // 403: token lacks the scope
 	usageWarmWait    = 2 * time.Second  // first view waits for first cycle
+	usageIdleAfter   = 5 * time.Minute  // stop polling when nobody has looked
 )
 
 // UsageAPI is one account's real usage as answered by the usage API. It is
@@ -140,8 +141,8 @@ func (raw *usageAPIResponse) usage(now time.Time) *UsageAPI {
 	}
 	if raw.ExtraUsage != nil && raw.ExtraUsage.IsEnabled {
 		out.Spend = &UsageAPISpend{
-			Used:     raw.ExtraUsage.UsedCredits,
-			Limit:    raw.ExtraUsage.MonthlyLimit,
+			Used:     fromCents(raw.ExtraUsage.UsedCredits),
+			Limit:    fromCents(raw.ExtraUsage.MonthlyLimit),
 			Pct:      deref(raw.ExtraUsage.Utilization),
 			Currency: raw.ExtraUsage.Currency,
 			ResetsAt: parseUsageTime(raw.ExtraUsage.ResetsAt),
@@ -244,6 +245,14 @@ func (e *usageEntry) nextBackoff() time.Duration {
 	return e.backoff
 }
 
+// forget drops an account's cached result and backoff so the next cycle
+// fetches it afresh.
+func (p *usagePoller) forget(name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.entries, name)
+}
+
 // snapshot returns the cached result for an account (nil, nil when never
 // fetched — e.g. API-key accounts, which are never polled).
 func (p *usagePoller) snapshot(name string) (*UsageAPI, string) {
@@ -282,7 +291,9 @@ func (s *Server) pollUsageOnce(ctx context.Context) {
 
 // pollUsageLoop keeps usage warm while anyone is watching: one immediate
 // refresh, then a tick every 15s (successful entries are re-fetched at most
-// once per minute, failures back off).
+// once per minute, failures back off). Ticks are skipped once no usage view
+// has arrived for usageIdleAfter, so an unwatched server stops querying the
+// usage API until the next view.
 func (s *Server) pollUsageLoop() {
 	ctx, cancel := context.WithTimeout(context.Background(), usageCycleBudget)
 	s.pollUsageOnce(ctx)
@@ -293,6 +304,9 @@ func (s *Server) pollUsageLoop() {
 	for {
 		select {
 		case <-t.C:
+			if time.Since(time.Unix(0, s.usageViewed.Load())) > usageIdleAfter {
+				continue
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), usageCycleBudget)
 			s.pollUsageOnce(ctx)
 			cancel()
@@ -306,6 +320,7 @@ func (s *Server) pollUsageLoop() {
 // waits briefly for its first cycle, so the first dashboard or `cproxy
 // usage` view already shows live numbers. Later calls return immediately.
 func (s *Server) ensureUsageWarm() {
+	s.usageViewed.Store(time.Now().UnixNano())
 	s.usageOnce.Do(func() { go s.pollUsageLoop() })
 	select {
 	case <-s.usageWarm:
@@ -386,6 +401,16 @@ func parseUsageTime(s string) *time.Time {
 		return &t
 	}
 	return nil
+}
+
+// fromCents converts extra-usage credit amounts, which the API reports in
+// minor currency units (claude-swap divides them by 100 too).
+func fromCents(p *float64) *float64 {
+	if p == nil {
+		return nil
+	}
+	v := *p / 100
+	return &v
 }
 
 func deref[T any](p *T) T {

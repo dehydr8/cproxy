@@ -19,12 +19,14 @@ conversation is paid for once, on one subscription. Other strategies
 
 Failover:
 
-- **429** — the account cools down (honoring `Retry-After` when present) and
+- **429** — the account cools down (until `Retry-After`, else the
+  subscription's `anthropic-ratelimit-unified-reset`, else 10 minutes) and
   the client is retried on the next account; it returns to the pool when the
   cooldown expires.
-- **401/403** — the account is marked invalid and excluded until the token
+- **401** — the account is marked invalid and excluded until the token
   changes on reload.
-- Transport errors — the account is benched briefly and another is tried.
+- Transport errors — the account is benched briefly and another is tried
+  (a client hanging up mid-request does not count against the account).
 
 ## Install
 
@@ -38,7 +40,7 @@ curl -fsSL https://github.com/dehydr8/cproxy/releases/latest/download/cproxy-lin
 install -m 755 /tmp/cproxy ~/.local/bin/cproxy
 ```
 
-or with Go 1.24+:
+or with Go 1.27+:
 
 ```sh
 go install github.com/dehydr8/cproxy@latest
@@ -88,6 +90,10 @@ just execs `cproxy claude --exec <real binary>`, which on every launch:
 2. starts a shared `cproxy serve` on `127.0.0.1:7788` (`$CPROXY_PORT`) if
    nothing is listening there yet — inheriting the current environment, so
    env-configured credentials just work — logging to `~/.cproxy/serve.log`;
+   then checks that whatever listens there is a cproxy holding that client
+   token (a challenge that never sends the token itself), so the token is
+   never handed to another program on the port and a stale serve is
+   reported with the `kill <pid>` to fix it;
 3. launches the real claude with `ANTHROPIC_BASE_URL` /
    `ANTHROPIC_AUTH_TOKEN` pointed at it (and `CPROXY_*` secrets stripped).
 
@@ -182,8 +188,11 @@ replaces the `Authorization` header with a pool account's credential. Nothing
 is ever written back: `credentials.json` (or the env) is the only token store;
 `cproxy token` mints and prints one, you put it where you want it.
 
-- Send `SIGHUP` to reload `credentials.json` without dropping connections
-  (accounts whose tokens changed lose their sticky assignments and cooldowns).
+- Edits to `credentials.json` (e.g. `cproxy accounts add`) are picked up
+  within ~2s, or immediately on `SIGHUP`, without dropping connections
+  (accounts whose tokens changed lose their cooldowns and cached usage).
+  Environment variables are read once at startup; restart serve to change
+  them.
 - Each client token can route to its own pool: `{"token": "cp_…", "pool": "cvp"}`.
 - Run behind TLS (`--tls-cert/--tls-key`) or a terminating proxy when exposing
   beyond localhost. `--no-auth` exists for localhost-only experiments.
@@ -203,7 +212,7 @@ someone who should see pool health but never spend it.
 
 Serve mode exposes `/usage`:
 
-- **HTML** (htmx, auto-refreshes every 2s): accounts with request counts, 429s,
+- **HTML** (auto-refreshes every 2s; no external scripts): accounts with request counts, 429s,
   cooldown state, sticky pin per client, real utilization from Anthropic's
   usage API, and the last-seen
   `anthropic-ratelimit-*` values from upstream — e.g.
@@ -315,7 +324,8 @@ re-run `cproxy install` once.
 - Upstream account tokens never appear in child environments, client requests,
   logs, `/usage` output, or JSON.
 - Client tokens are the only thing other users ever hold; revoke them by
-  removing them from the file/env and sending `SIGHUP`.
+  removing them from `credentials.json` (picked up automatically) or from
+  the environment (restart serve).
 - `credentials.json` is written with `0600` and contains raw tokens — protect
   the home directory accordingly.
 - Serve beyond localhost only with TLS or a terminating proxy in front.

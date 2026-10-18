@@ -64,11 +64,12 @@ type Server struct {
 	maxBody  int64
 	started  time.Time // for the usage dashboard's uptime
 
-	usage     *usagePoller // real usage API cache (preferred usage source)
-	usageStop chan struct{}
-	usageWarm chan struct{} // closed after the poller's first cycle
-	usageOnce sync.Once
-	closeOnce sync.Once
+	usage       *usagePoller // real usage API cache (preferred usage source)
+	usageStop   chan struct{}
+	usageWarm   chan struct{} // closed after the poller's first cycle
+	usageViewed atomic.Int64  // unix nanos of the last usage view
+	usageOnce   sync.Once
+	closeOnce   sync.Once
 }
 
 // New builds a proxy server from opts.
@@ -120,6 +121,14 @@ func (s *Server) Update(st *State) { s.state.Store(st) }
 // Selector exposes the shared selector so reloads can clear stale health.
 func (s *Server) Selector() *pool.Selector { return s.sel }
 
+// ForgetAccount drops an account's health state and cached usage API result,
+// e.g. after a reload replaced its token: a 401 or a 403 scope error from the
+// old token must not stick to the new one.
+func (s *Server) ForgetAccount(name string) {
+	s.sel.ClearAccount(name)
+	s.usage.forget(name)
+}
+
 func (st *State) authenticate(r *http.Request) (config.ClientAuth, bool) {
 	if st.NoAuth {
 		return config.ClientAuth{Name: "anonymous"}, true
@@ -168,6 +177,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	st := s.state.Load()
 
+	if r.URL.Path == WhoamiPath && r.Method == http.MethodGet {
+		s.serveWhoami(w, r, st) // unauthenticated by design; see WhoamiPath
+		return
+	}
+
 	ca, ok := st.authenticate(r)
 	if !ok {
 		s.log.Warn("rejected client", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
@@ -207,12 +221,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pn := poolNameFor(ca)
+	// Read the pin before Ranked, which remaps a client whose pinned account
+	// became unavailable.
+	prev := s.sel.Assignment(pn, ca.Name)
 	ranked := s.sel.Ranked(members, strategy, pn, ca.Name)
 	if len(ranked) == 0 {
 		s.rejectAllUnavailable(w, members, pn, ca)
 		return
 	}
-	if prev := s.sel.Assignment(pn, ca.Name); prev != "" && prev != ranked[0].Name {
+	if prev != "" && prev != ranked[0].Name {
 		s.log.Warn("switching account", "client", ca.Name, "pool", pn,
 			"from", prev, "to", ranked[0].Name, "reason", "previous account unavailable")
 	}
@@ -223,9 +240,19 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for _, acct := range ranked {
 		resp, err := s.forward(r, body, replay, acct)
 		if err != nil {
+			if r.Context().Err() != nil {
+				// The client went away (e.g. interrupted in Claude); that says
+				// nothing about the account, and every further attempt would
+				// fail the same way and bench the whole pool.
+				s.log.Info("client canceled request", "client", ca.Name, "account", acct.Name)
+				return
+			}
 			lastErr = err
 			s.log.Warn("upstream attempt failed", "account", acct.Name, "err", err.Error())
 			s.sel.MarkError(acct.Name, time.Now().Add(15*time.Second))
+			if !replay {
+				break // the streamed body is (partly) consumed; it cannot be resent
+			}
 			continue
 		}
 
@@ -248,7 +275,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
-			until := retryAfter(resp, 10*time.Minute)
+			until := rateLimitedUntil(resp, 10*time.Minute)
 			s.sel.MarkRateLimited(acct.Name, until)
 			s.log.Warn("account rate limited", "account", acct.Name,
 				"cooldown", until.Sub(time.Now()).Round(time.Second), "can_retry", replay)
@@ -262,6 +289,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		s.sel.MarkSuccess(acct.Name)
+		if strategy == pool.StrategySticky && acct.Name != ranked[0].Name {
+			// Failed over: keep the client on the account that now holds its
+			// conversation instead of remapping it again next request.
+			s.sel.Pin(pn, ca.Name, acct.Name)
+		}
 		s.copyResponse(rec, resp)
 		s.logDone(r, rec, ca, pn, acct.Name, start)
 		return
@@ -443,6 +475,23 @@ func retryAfter(resp *http.Response, def time.Duration) time.Time {
 		}
 		if t.After(now.Add(24 * time.Hour)) {
 			return now.Add(24 * time.Hour)
+		}
+		return t
+	}
+	return now.Add(def)
+}
+
+// rateLimitedUntil decides how long a 429'd account cools down: Retry-After
+// when present, else the subscription's unified reset time (sent on OAuth
+// responses as epoch seconds), else def. Capped at 24h like retryAfter.
+func rateLimitedUntil(resp *http.Response, def time.Duration) time.Time {
+	if strings.TrimSpace(resp.Header.Get("Retry-After")) != "" {
+		return retryAfter(resp, def)
+	}
+	now := time.Now()
+	if t, ok := headerReset(resp.Header, "Anthropic-Ratelimit-Unified-Reset"); ok && t.After(now) {
+		if limit := now.Add(24 * time.Hour); t.After(limit) {
+			return limit
 		}
 		return t
 	}
