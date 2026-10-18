@@ -388,9 +388,15 @@ and machines without cproxy behave exactly as before.
    its own local client token. Optionally add `CPROXY_CLIENT_TOKENS`, e.g.
    `monitor:cp_…:usage` for a dashboard-only viewer.
 3. The first `claude` launch in an orb starts serve on `127.0.0.1:7788`
-   (inheriting those env vars), injects the routing into claude, and
-   registers the `/usage` dashboard as an orb portal. Each Amp thread gets
-   a stable client identity, sticks to one account, and fails over on 429.
+   (inheriting those env vars) and injects the routing into claude. Each
+   Amp thread gets a stable client identity, sticks to one account, and
+   fails over on 429.
+4. Every launch also registers the `/usage` dashboard as an orb portal
+   named **cproxy usage**, so the live dashboard is one click away in the
+   thread. Its link carries a generated usage-only token
+   (`~/.cproxy/dashboard-token`), so it opens without asking for one and
+   can only look, never spend. Like every portal it is private to you
+   unless you make it public in Amp.
 
 If the vars are absent the shim injects nothing, so the same setup works
 with or without cproxy. Clients that never launch the `claude` binary point

@@ -137,7 +137,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	launch.NotifyHUP(hup)
 	go func() {
 		cur := rt
-		watchReloads(hup, []string{config.Path(), config.LocalTokenPath()}, credentialsPoll, func() {
+		watchReloads(hup, []string{config.Path(), config.LocalTokenPath(), config.DashboardTokenPath()}, credentialsPoll, func() {
 			if next := reloadServe(srv, cur); next != nil {
 				cur = next
 			}

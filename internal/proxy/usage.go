@@ -342,7 +342,8 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 	// "local" session, --no-auth's "anonymous").
 	seen := map[string]bool{}
 	addClient := func(ca config.ClientAuth) {
-		if seen[ca.Name] {
+		// The orb portal's built-in viewer only looks; it is not a client.
+		if seen[ca.Name] || ca.Name == config.DashboardClientName {
 			return
 		}
 		seen[ca.Name] = true

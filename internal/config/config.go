@@ -46,6 +46,9 @@ type FileConfig struct {
 	// LocalToken is the auto-generated local client token (LocalTokenPath),
 	// filled in by Load and never written back to credentials.json.
 	LocalToken string `json:"-"`
+	// DashboardToken is the usage-only token for the orb dashboard portal
+	// (DashboardTokenPath), also filled in by Load only.
+	DashboardToken string `json:"-"`
 }
 
 // PoolConfig tweaks a named pool.
@@ -157,13 +160,17 @@ func Path() string { return filepath.Join(Home(), "credentials.json") }
 // Load reads credentials.json (a missing file yields an empty config) and
 // the auto-generated local client token, if any.
 func Load() (*FileConfig, error) {
-	local, err := readLocalToken()
+	local, err := readTokenFile(LocalTokenPath())
+	if err != nil {
+		return nil, err
+	}
+	dash, err := readTokenFile(DashboardTokenPath())
 	if err != nil {
 		return nil, err
 	}
 	b, err := os.ReadFile(Path())
 	if errors.Is(err, os.ErrNotExist) {
-		return &FileConfig{LocalToken: local}, nil
+		return &FileConfig{LocalToken: local, DashboardToken: dash}, nil
 	}
 	if err != nil {
 		return nil, err
@@ -175,7 +182,7 @@ func Load() (*FileConfig, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", Path(), err)
 	}
-	cfg.LocalToken = local
+	cfg.LocalToken, cfg.DashboardToken = local, dash
 	return &cfg, nil
 }
 
@@ -348,6 +355,11 @@ func Build(file *FileConfig, environ []string) (*Runtime, error) {
 	if file.LocalToken != "" {
 		if _, ok := rt.ClientAuth[file.LocalToken]; !ok {
 			rt.ClientAuth[file.LocalToken] = ClientAuth{Name: LocalClientName, Scopes: slices.Clone(AllScopes)}
+		}
+	}
+	if file.DashboardToken != "" {
+		if _, ok := rt.ClientAuth[file.DashboardToken]; !ok {
+			rt.ClientAuth[file.DashboardToken] = ClientAuth{Name: DashboardClientName, Scopes: []string{ScopeUsage}}
 		}
 	}
 
