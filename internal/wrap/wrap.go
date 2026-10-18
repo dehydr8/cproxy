@@ -29,6 +29,10 @@ const BackupSuffix = ".cproxy-real"
 var (
 	ErrAlreadyInstalled = errors.New("cproxy shim is already installed at this path")
 	ErrNotInstalled     = errors.New("no cproxy shim is installed at this path")
+	// ErrNoClientToken means pool accounts are configured but no client
+	// token is; `cproxy claude` answers it by creating the local token
+	// (config.EnsureLocalToken) and deciding again.
+	ErrNoClientToken = errors.New("pool accounts are configured but no client token is")
 )
 
 // ShimScript is the script written over the claude binary. It is
@@ -139,9 +143,9 @@ const (
 //     can drive the wrapper)
 //  3. the first proxy-scoped token in $CPROXY_CLIENT_TOKENS list order
 //  4. the first proxy-scoped token in credentials.json, by client name
+//  5. the auto-generated local token (config.LocalClientName)
 //
-// Accounts without any client token are an error: the shim is installed,
-// so pooling is wanted, but serve mode cannot authenticate claude.
+// Accounts without any client token yield ErrNoClientToken.
 func Decide(rt *config.Runtime, environ []string) (plan Plan, reason, token string, ca config.ClientAuth, err error) {
 	// Foreign routing wins: never clobber a base URL the environment
 	// already carries.
@@ -168,23 +172,35 @@ func Decide(rt *config.Runtime, environ []string) (plan Plan, reason, token stri
 			return PlanProxy, "", e.Spec.Token, ca, nil
 		}
 	}
-	// File-configured client tokens have no list order; pick by name.
+	// File-configured client tokens have no list order; pick by name. The
+	// auto-generated local token is the fallback, so a token configured
+	// later takes over.
 	var names []string
 	byName := map[string]string{}
+	local := ""
 	for tok, ca := range rt.ClientAuth {
-		if ca.HasScope(config.ScopeProxy) {
-			names = append(names, ca.Name)
-			byName[ca.Name] = tok
+		if !ca.HasScope(config.ScopeProxy) {
+			continue
 		}
+		if ca.Name == config.LocalClientName {
+			local = tok
+			continue
+		}
+		names = append(names, ca.Name)
+		byName[ca.Name] = tok
 	}
 	if len(names) > 0 {
 		sort.Strings(names)
 		tok := byName[names[0]]
 		return PlanProxy, "", tok, rt.ClientAuth[tok], nil
 	}
+	// The local token only exists to serve pool accounts; left over after
+	// the accounts are gone, it must not stop claude from passing through.
+	if local != "" && len(rt.Accounts) > 0 {
+		return PlanProxy, "", local, rt.ClientAuth[local], nil
+	}
 	if len(rt.Accounts) > 0 {
-		return 0, "", "", config.ClientAuth{},
-			errors.New("pool accounts are configured but no client token is; generate one with `cproxy token` and add it to credentials.json or CPROXY_CLIENT_TOKENS (or run claude per-invocation with `cproxy run -- claude`)")
+		return 0, "", "", config.ClientAuth{}, ErrNoClientToken
 	}
 	return PlanPassThrough, "no cproxy credentials are configured", "", config.ClientAuth{}, nil
 }

@@ -34,7 +34,9 @@ Credentials come from the usual places (environment or
 ~/.cproxy/credentials.json). The client token claude presents is picked
 from the configured client tokens: $CPROXY_AUTH_TOKEN, then a matching
 $ANTHROPIC_AUTH_TOKEN, then the first proxy-scoped token in
-$CPROXY_CLIENT_TOKENS, then credentials.json.
+$CPROXY_CLIENT_TOKENS, then credentials.json. With pool accounts but no
+client token, cproxy creates a private local one (~/.cproxy/local-token)
+shared with the serve instance, so CPROXY_TOKENS alone is enough.
 
 It backs off — running claude completely untouched — when nothing is
 configured, or when the environment already carries its own Anthropic
@@ -91,6 +93,20 @@ func runClaude(cmd *cobra.Command, args []string) error {
 	}
 
 	plan, reason, token, _, err := wrap.Decide(rt, os.Environ())
+	if errors.Is(err, wrap.ErrNoClientToken) {
+		// Accounts but no client token: the wrapper and its serve are both
+		// ours, so mint the shared local token instead of asking for one.
+		if _, err := config.EnsureLocalToken(); err != nil {
+			return fmt.Errorf("create the local client token: %w", err)
+		}
+		if file, err = config.Load(); err != nil {
+			return err
+		}
+		if rt, err = config.Build(file, os.Environ()); err != nil {
+			return err
+		}
+		plan, reason, token, _, err = wrap.Decide(rt, os.Environ())
+	}
 	if err != nil {
 		return err
 	}

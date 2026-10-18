@@ -204,9 +204,36 @@ func TestDecide(t *testing.T) {
 			wantPlan:  PlanProxy,
 		},
 		{
-			name:    "accounts without any client token are an error",
+			name:    "accounts without any client token ask for the local token",
 			rt:      &config.Runtime{Accounts: accounts},
 			wantErr: true,
+		},
+		{
+			name: "the local token is the fallback",
+			rt: &config.Runtime{Accounts: accounts, ClientAuth: map[string]config.ClientAuth{
+				"cp_local": {Name: config.LocalClientName},
+				"cp_mon":   {Name: "mon", Scopes: []string{config.ScopeUsage}},
+			}},
+			wantToken: "cp_local",
+			wantPlan:  PlanProxy,
+		},
+		{
+			name: "a leftover local token without accounts passes through",
+			rt: &config.Runtime{ClientAuth: map[string]config.ClientAuth{
+				"cp_local": {Name: config.LocalClientName},
+			}},
+			wantPlan: PlanPassThrough,
+		},
+		{
+			// "zeta" sorts after "claude-local": a configured token must
+			// still win over the generated one.
+			name: "a configured token beats the local token",
+			rt: &config.Runtime{Accounts: accounts, ClientAuth: map[string]config.ClientAuth{
+				"cp_local": {Name: config.LocalClientName},
+				"cp_zeta":  {Name: "zeta"},
+			}},
+			wantToken: "cp_zeta",
+			wantPlan:  PlanProxy,
 		},
 		{
 			name:     "nothing configured passes through",
@@ -221,6 +248,9 @@ func TestDecide(t *testing.T) {
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("Decide = %v, want error", plan)
+				}
+				if tt.rt.ClientAuth == nil && !errors.Is(err, ErrNoClientToken) {
+					t.Fatalf("err = %v, want ErrNoClientToken", err)
 				}
 				return
 			}

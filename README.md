@@ -86,7 +86,9 @@ just execs `cproxy claude --exec <real binary>`, which on every launch:
 
 1. picks the client token claude will present: `$CPROXY_AUTH_TOKEN`, a
    matching `$ANTHROPIC_AUTH_TOKEN`, or the first proxy-scoped client token
-   in `$CPROXY_CLIENT_TOKENS` / `credentials.json`;
+   in `$CPROXY_CLIENT_TOKENS` / `credentials.json`. With none configured it
+   creates a private local token (`~/.cproxy/local-token`, `0600`) shared
+   with the serve it starts, so pool accounts alone are enough;
 2. starts a shared `cproxy serve` on `127.0.0.1:7788` (`$CPROXY_PORT`) if
    nothing is listening there yet — inheriting the current environment, so
    env-configured credentials just work — logging to `~/.cproxy/serve.log`;
@@ -280,11 +282,11 @@ and machines without cproxy behave exactly as before.
 
 1. Install cproxy in the orb and wrap `claude` (the post-install script
    below does both).
-2. In the Amp project's **Settings → Secrets & Env Vars**, add:
-   - `CPROXY_TOKENS` (or `CPROXY_POOL_TOKENS_<NAME>`) — the pooled account
-     tokens, marked as secrets;
-   - `CPROXY_CLIENT_TOKENS` — e.g. `amp:cp_…` for Claude Code, plus
-     `monitor:cp_…:usage` for a dashboard-only viewer.
+2. In Amp's **Secrets & Env Vars** (personal or project), add
+   `CPROXY_TOKENS` (or `CPROXY_POOL_TOKENS_<NAME>`) — the pooled account
+   tokens, marked as secrets. That is all claude needs; the wrapper creates
+   its own local client token. Optionally add `CPROXY_CLIENT_TOKENS`, e.g.
+   `monitor:cp_…:usage` for a dashboard-only viewer.
 3. The first `claude` launch in an orb starts serve on `127.0.0.1:7788`
    (inheriting those env vars), injects the routing into claude, and
    registers the `/usage` dashboard as an orb portal. Each Amp thread gets
@@ -297,13 +299,16 @@ instead (the wrapper sees those and stays out of the way).
 
 ### Amp post-install script
 
-Amp runs a project pre-setup script in every orb before agent work starts
-(project **Settings → Pre-setup script**). This one installs cproxy and
-wraps `claude` — the post-install step for Claude Code's binary:
+Set this as Claude Code's **post-install script** (Claude Code Settings in
+Amp; it runs after Amp installs Claude Code and before it launches). It
+installs cproxy and wraps `claude`, only inside Amp orbs:
 
 ```sh
 #!/bin/sh
 set -eu
+# Only inside Amp orbs; anywhere else leave claude untouched.
+[ "${AMP_ORB:-}" = "1" ] || exit 0
+export PATH="$HOME/.local/bin:$PATH"
 if ! command -v cproxy >/dev/null 2>&1; then
   mkdir -p "$HOME/.local/bin"
   curl -fsSL https://github.com/dehydr8/cproxy/releases/latest/download/cproxy-linux-amd64.tar.gz \
@@ -315,9 +320,8 @@ cproxy install
 
 It leaves no credentials behind — `cproxy install` only swaps in the shim;
 credentials arrive per-thread through the project env vars above (or a
-`credentials.json` under `$CPROXY_HOME`, which works too). The script needs
-the `claude` binary to exist; if Claude Code is installed after it runs,
-re-run `cproxy install` once.
+`credentials.json` under `$CPROXY_HOME`, which works too). Running it again
+is harmless; it reinstalls the shim after Claude Code updates.
 
 ## Security notes
 

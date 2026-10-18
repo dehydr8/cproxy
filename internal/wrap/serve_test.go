@@ -11,7 +11,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/dehydr8/cproxy/internal/config"
 	"github.com/dehydr8/cproxy/internal/proxy"
@@ -86,8 +88,28 @@ func TestEnsureServeSpawns(t *testing.T) {
 	}
 }
 
+func TestEnsureServeWaitsForReload(t *testing.T) {
+	t.Setenv("AMP_THREAD_ID", "")
+	// A running serve learns a just-created local token on its next reload.
+	var h atomic.Value
+	h.Store(cproxyKnowing("cp_old"))
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h.Load().(http.Handler).ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+	time.AfterFunc(500*time.Millisecond, func() { h.Store(cproxyKnowing("cp_new")) })
+
+	port := ts.Listener.Addr().(*net.TCPAddr).Port
+	if _, err := EnsureServe(ServeOptions{Port: port, Token: "cp_new"}); err != nil {
+		t.Fatalf("EnsureServe did not wait for the reload: %v", err)
+	}
+}
+
 func TestEnsureServeRefusesWrongListener(t *testing.T) {
 	t.Setenv("AMP_THREAD_ID", "")
+	old := verifyGrace
+	verifyGrace = 0
+	t.Cleanup(func() { verifyGrace = old })
 	const token = "cp_secret_token_value"
 
 	var seen []string

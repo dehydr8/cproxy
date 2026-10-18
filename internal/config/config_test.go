@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/dehydr8/cproxy/internal/pool"
@@ -397,5 +398,54 @@ func TestEnvHelpers(t *testing.T) {
 	}
 	if got := EnvPort(env); got != "7790" {
 		t.Fatalf("EnvPort = %q", got)
+	}
+}
+
+func TestLocalToken(t *testing.T) {
+	t.Setenv(EnvHome, t.TempDir())
+
+	// Concurrent first launches must all agree on one token.
+	toks := make([]string, 8)
+	var wg sync.WaitGroup
+	for i := range toks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tok, err := EnsureLocalToken()
+			if err != nil {
+				t.Error(err)
+			}
+			toks[i] = tok
+		}()
+	}
+	wg.Wait()
+	for _, tok := range toks {
+		if !strings.HasPrefix(tok, "cp_") || tok != toks[0] {
+			t.Fatalf("local tokens = %q; want one shared cp_ token", toks)
+		}
+	}
+	if info, err := os.Stat(LocalTokenPath()); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("local token file: %v %v", err, info.Mode())
+	}
+
+	// Load + Build register it with full access; Save never persists it.
+	file, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, err := Build(file, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, ok := rt.ClientAuth[toks[0]]
+	if !ok || ca.Name != LocalClientName || !ca.HasScope(ScopeProxy) || !ca.HasScope(ScopeUsage) {
+		t.Fatalf("local client = %+v (%v)", ca, ok)
+	}
+	file.Accounts = []pool.Account{{Name: "a", Token: "sk-ant-oat01-a"}}
+	if err := Save(file); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(Path()); strings.Contains(string(b), toks[0]) {
+		t.Fatalf("local token leaked into credentials.json:\n%s", b)
 	}
 }
