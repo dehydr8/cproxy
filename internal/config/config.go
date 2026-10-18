@@ -25,6 +25,7 @@ const (
 	EnvAuthTokenName     = "CPROXY_AUTH_TOKEN"    // client token the claude wrapper presents
 	EnvPortName          = "CPROXY_PORT"          // port of the wrapper's shared serve instance
 	EnvPoolName          = "CPROXY_POOL"          // pool used when --pool is not given
+	EnvSwitchAtName      = "CPROXY_SWITCH_AT"     // utilization % at which sticky clients move
 	EnvTokenPrefix       = "CPROXY_TOKEN_"        // + NAME → one default-pool account
 	EnvPoolTokenPref     = "CPROXY_POOL_TOKEN_"   // + POOL_NAME → one account in POOL
 )

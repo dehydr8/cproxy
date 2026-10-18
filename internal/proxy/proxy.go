@@ -259,7 +259,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 	}
 	if prev != "" && prev != ranked[0].Name {
 		s.log.Warn("switching account", "client", ca.Name, "pool", pn,
-			"from", prev, "to", ranked[0].Name, "reason", "previous account unavailable")
+			"from", prev, "to", ranked[0].Name, "reason", s.sel.SwitchReason(pn, ca.Name))
 	}
 
 	rec := &recorder{ResponseWriter: w, status: http.StatusOK}

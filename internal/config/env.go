@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/dehydr8/cproxy/internal/pool"
@@ -277,6 +278,25 @@ func ClientTokensFromList(list string) map[string]ClientTokenSpec {
 		specs[e.Name] = e.Spec
 	}
 	return specs
+}
+
+// SwitchPolicy returns how sticky clients move between accounts:
+// pool.DefaultSwitchPolicy, with the threshold from CPROXY_SWITCH_AT when
+// set (a percentage; 0 turns proactive moves off).
+func SwitchPolicy(environ []string) (pool.SwitchPolicy, error) {
+	p := pool.DefaultSwitchPolicy
+	for _, kv := range environ {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || k != EnvSwitchAtName || strings.TrimSpace(v) == "" {
+			continue
+		}
+		f, err := strconv.ParseFloat(strings.TrimSuffix(strings.TrimSpace(v), "%"), 64)
+		if err != nil || f < 0 || f > 100 {
+			return p, fmt.Errorf("%s=%q: want a percentage from 0 (off) to 100", EnvSwitchAtName, v)
+		}
+		p.Threshold = f
+	}
+	return p, nil
 }
 
 // EnvPool returns CPROXY_POOL from environ, or "".

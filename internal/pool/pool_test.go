@@ -273,3 +273,73 @@ func TestRateLimitStats(t *testing.T) {
 		t.Fatalf("rate limits survived ClearAccount: %+v", got)
 	}
 }
+
+// seen records a response's subscription windows for an account, as the
+// proxy does from anthropic-ratelimit-unified-* headers.
+func seen(s *Selector, name string, fiveHour, sevenDay float64) {
+	s.MarkRateLimits(name, RateLimitInfo{FiveHourPct: &fiveHour, SevenDayPct: &sevenDay, Seen: time.Now()})
+}
+
+func TestStickyMovesBeforeTheLimit(t *testing.T) {
+	s := NewSelector() // DefaultSwitchPolicy: 90%, 10 points, 5m
+	m := accounts("a", "b", "c")
+	if got := head(t, s, m, StrategySticky, "p", "c1"); got.Name != "a" {
+		t.Fatalf("first pin = %q, want a", got.Name)
+	}
+	seen(s, "a", 40, 89) // binding window is the 7-day one
+	seen(s, "b", 70, 30)
+	seen(s, "c", 20, 25)
+	if got := head(t, s, m, StrategySticky, "p", "c1"); got.Name != "a" {
+		t.Fatalf("moved at 89%%: %q", got.Name)
+	}
+	seen(s, "a", 40, 91)
+	// c has the most headroom (binding 25%) though b's 7-day is lower.
+	if got := head(t, s, m, StrategySticky, "p", "c1"); got.Name != "c" {
+		t.Fatalf("at 91%% moved to %q, want c (most headroom)", got.Name)
+	}
+	if why := s.SwitchReason("p", "c1"); !strings.Contains(why, "a at 91%") || !strings.Contains(why, "c at 25%") {
+		t.Fatalf("switch reason = %q", why)
+	}
+	// Within the cooldown it stays put even if c fills up too.
+	seen(s, "c", 95, 95)
+	if got := head(t, s, m, StrategySticky, "p", "c1"); got.Name != "c" {
+		t.Fatalf("moved again within the cooldown: %q", got.Name)
+	}
+}
+
+func TestStickyHysteresisAndRollover(t *testing.T) {
+	s := NewSelector()
+	m := accounts("a", "b")
+	head(t, s, m, StrategySticky, "p", "c1") // pins a
+	// b is under the threshold but not 10 points better than a: stay.
+	seen(s, "a", 92, 10)
+	seen(s, "b", 85, 10)
+	if got := head(t, s, m, StrategySticky, "p", "c1"); got.Name != "a" {
+		t.Fatalf("moved to %q, only 7 points better", got.Name)
+	}
+	// A window whose reset has passed counts as empty.
+	past := time.Now().Add(-time.Minute)
+	ninety := 95.0
+	s.MarkRateLimits("a", RateLimitInfo{FiveHourPct: &ninety, FiveHourReset: &past, Seen: time.Now()})
+	if got := head(t, s, m, StrategySticky, "p", "c1"); got.Name != "a" {
+		t.Fatalf("moved off a rolled-over window: %q", got.Name)
+	}
+
+	s.SetSwitchPolicy(SwitchPolicy{}) // threshold 0: never move proactively
+	seen(s, "a", 99, 99)
+	seen(s, "b", 1, 1)
+	if got := head(t, s, m, StrategySticky, "p", "c1"); got.Name != "a" {
+		t.Fatalf("moved with proactive switching off: %q", got.Name)
+	}
+}
+
+func TestStickyNewPinsTakeMostHeadroom(t *testing.T) {
+	s := NewSelector()
+	m := accounts("a", "b", "c")
+	seen(s, "a", 60, 60)
+	seen(s, "b", 10, 5)
+	seen(s, "c", 30, 30)
+	if got := head(t, s, m, StrategySticky, "p", "new"); got.Name != "b" {
+		t.Fatalf("new client pinned to %q, want b (most headroom)", got.Name)
+	}
+}

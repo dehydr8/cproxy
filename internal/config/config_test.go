@@ -563,3 +563,18 @@ func TestLocalToken(t *testing.T) {
 		t.Fatalf("local tokens leaked into credentials.json:\n%s", b)
 	}
 }
+
+func TestSwitchPolicyFromEnv(t *testing.T) {
+	if p, err := SwitchPolicy(nil); err != nil || p != pool.DefaultSwitchPolicy {
+		t.Fatalf("default = %+v (%v)", p, err)
+	}
+	if p, err := SwitchPolicy([]string{"CPROXY_SWITCH_AT=80%"}); err != nil || p.Threshold != 80 || p.Hysteresis != pool.DefaultSwitchPolicy.Hysteresis {
+		t.Fatalf("80%% = %+v (%v)", p, err)
+	}
+	if p, err := SwitchPolicy([]string{"CPROXY_SWITCH_AT=0"}); err != nil || p.Threshold != 0 {
+		t.Fatalf("off = %+v (%v)", p, err)
+	}
+	if _, err := SwitchPolicy([]string{"CPROXY_SWITCH_AT=lots"}); err == nil {
+		t.Fatal("garbage accepted")
+	}
+}

@@ -33,6 +33,14 @@ func TestMain(m *testing.M) {
 		http.Serve(ln, cproxyKnowing(os.Getenv("CPROXY_WRAP_TEST_TOKEN")))
 		os.Exit(0)
 	}
+	// No ambient configuration in tests: the developer's own pool tokens
+	// must never reach a test or its output.
+	for _, kv := range os.Environ() {
+		k, _, _ := strings.Cut(kv, "=")
+		if strings.HasPrefix(k, "CPROXY_") || strings.HasPrefix(k, "ANTHROPIC_") || k == "CLAUDE_CODE_OAUTH_TOKEN" {
+			os.Unsetenv(k)
+		}
+	}
 	os.Exit(m.Run())
 }
 

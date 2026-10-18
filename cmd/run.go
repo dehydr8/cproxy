@@ -95,6 +95,10 @@ func runRun(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	policy, err := config.SwitchPolicy(os.Environ())
+	if err != nil {
+		return err
+	}
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", runPort))
 	if err != nil {
@@ -126,6 +130,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 	}
 
 	srv := proxy.New(proxy.Options{Upstream: upstream, State: st, Log: newLogger()})
+	srv.Selector().SetSwitchPolicy(policy)
 	httpSrv := &http.Server{Handler: srv}
 	go httpSrv.Serve(ln)
 
