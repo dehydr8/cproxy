@@ -388,32 +388,35 @@ can't set headers — `GET /usage?token=cp_…` (the token stays in the URL, so
 prefer a dashboard-scoped token for this). Tokens without the `usage` scope
 get `403 permission_error`.
 
-Usage comes from two mechanisms, and the first is preferred whenever the
-token can answer it:
+Usage numbers come from three places, freshest first:
 
-1. **Real usage API** (preferred): cproxy polls
-   `GET /api/oauth/usage` in the background — lazily, starting with the first
-   usage view — and shows per-account 5-hour and 7-day utilization
-   (`5h 42.5% (resets 1h 30m) · 7d 12%`), spend with its monthly limit
-   (`spend USD 25.5/500`) and per-model weekly limits (`Fable 20%`), as
-   `usage_api` in the JSON. The same tokens also answer
-   `GET /api/oauth/profile`, so each account shows the email it belongs to
-   and its plan (`Max 20x`, `Team · 5x`; `email` / `organization` / `plan`
-   in the JSON). This needs the `user:profile` scope — which
-   `cproxy setup-token` mints by default. Tokens that cannot query it (an
-   inference-only token, a revoked one) show a note like
-   `usage API: 403 (token needs the user:profile scope)` instead, and back off
-   instead of retrying. API-key accounts are not polled.
-2. **Rate-limit headers** (labeled fallback): the
-   `anthropic-ratelimit-requests-*`, `anthropic-ratelimit-tokens-*` and
-   `anthropic-ratelimit-unified-status` headers cproxy already sees as the
-   proxy, which keep request/token granularity even when the usage API is
-   unavailable.
+1. **Rate-limit headers** (live, free): every response from an OAuth account
+   carries its subscription windows (`anthropic-ratelimit-unified-5h/7d-*`),
+   so an account in use updates on every request. API keys report request
+   and token limits instead (`req 38/50 · tok 31.2k/40.0k`).
+2. **Usage API** (`GET /api/oauth/usage`, polled in the background while
+   someone looks at the usage — see the cadence below): 5-hour and 7-day
+   utilization with resets, extra-usage spend against its monthly limit, and
+   per-model weekly limits (`usage_api` in the JSON). The same tokens answer
+   `GET /api/oauth/profile`, so each account shows its email and plan
+   (`Max 20x`, `Team · 5x`). Both need the `user:profile` scope, which
+   `cproxy setup-token` mints by default.
+3. **Haiku probe** (inference-only tokens): the usage API refuses tokens
+   without `user:profile` (403). For those, when an account has had no
+   traffic for 15 minutes, cproxy runs one minimal real Claude Code turn with
+   the token — claude-swap's method: `claude -p` on Haiku, no tools,
+   settings, MCP or history, in a throwaway config directory, a few hundred
+   tokens — and reads the 5-hour / 7-day windows from Claude Code's own
+   `rate_limit_event`. At most every 15 minutes per account, only while the
+   usage poller runs, and only where a `claude` binary is installed (so not
+   on a remote serve). The dashboard marks these "via a Haiku probe".
 
-Both are shown side by side (usage API numbers in the `usage` column, inferred
-rate limits in `rate limits`), plus cproxy's own counters (requests/429s/errors/
-sticky pins per account and client). Upstream tokens are always masked in
-dashboard and JSON output.
+Proactive switching uses the freshest of these for every account. Polling
+cadence: the dashboard re-reads cproxy every 2s (no upstream cost); the usage
+API is asked at most once a minute per account and the profile every 6
+hours, both only while a dashboard or `cproxy usage` has been looked at in
+the last 5 minutes, backing off on errors. Upstream tokens are always masked
+in dashboard and JSON output.
 
 ## setup-token
 

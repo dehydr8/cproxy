@@ -358,6 +358,15 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 			row.State, row.Tone = "available", "ok"
 			data.Available++
 		}
+		// A probe result is only worth showing until real traffic reports
+		// fresher windows in its response headers.
+		if apiData != nil && apiData.Source == "probe" {
+			if rl := stt.RateLimits; rl != nil && rl.FiveHourPct != nil && rl.Seen.After(apiData.FetchedAt) {
+				apiData = nil
+			} else {
+				row.UsageNote = "via a Haiku probe " + ago(apiData.FetchedAt)
+			}
+		}
 		if apiData != nil {
 			if w := apiData.FiveHour; w != nil {
 				row.Meters = append(row.Meters, newMeter("5-hour", w.Pct, w.ResetsAt, now))

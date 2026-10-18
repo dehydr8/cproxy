@@ -49,6 +49,7 @@ type UsageAPI struct {
 	Spend     *UsageAPISpend   `json:"spend,omitempty"`
 	Scoped    []UsageAPIScoped `json:"scoped,omitempty"`
 	FetchedAt time.Time        `json:"fetched_at"`
+	Source    string           `json:"source,omitempty"` // "" usage API, "probe" a Haiku probe
 }
 
 type UsageAPIWindow struct {
@@ -280,6 +281,11 @@ type usageEntry struct {
 
 	profile        *AccountProfile // kept across failed refreshes
 	profileRetryAt time.Time
+
+	forbidden bool      // the usage API refuses this token (403: no user:profile)
+	probe     *UsageAPI // last Haiku probe result, for forbidden tokens
+	probeAt   time.Time
+	probing   bool
 }
 
 func (p *usagePoller) due(name string, now time.Time) bool {
@@ -302,11 +308,13 @@ func (p *usagePoller) record(name string, data *UsageAPI, err error, now time.Ti
 	}
 	e.fetchedAt = now
 	if err == nil {
-		e.data, e.err, e.backoff = data, "", 0
+		e.data, e.err, e.backoff, e.forbidden = data, "", 0, false
 		e.retryAt = now.Add(usageFreshFor)
 		return
 	}
 	e.data, e.err = nil, err.Error()
+	var ue403 *usageAPIError
+	e.forbidden = errors.As(err, &ue403) && ue403.status == http.StatusForbidden
 	var wait time.Duration
 	if ue, ok := err.(*usageAPIError); ok {
 		switch {
@@ -381,6 +389,33 @@ func (p *usagePoller) forget(name string) {
 	delete(p.entries, name)
 }
 
+// claimProbe reports whether an account should be probed now — its usage
+// API refuses it, it was not probed for probeEvery, and no response headers
+// arrived for it that long (real traffic reports its windows for free) —
+// and if so marks the probe as running.
+func (p *usagePoller) claimProbe(name string, now, lastHeaders time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.entries[name]
+	if e == nil || !e.forbidden || e.probing || now.Sub(e.probeAt) < probeEvery || now.Sub(lastHeaders) < probeEvery {
+		return false
+	}
+	e.probing = true
+	return true
+}
+
+// recordProbe stores a probe's result; a failure keeps the previous one.
+func (p *usagePoller) recordProbe(name string, data *UsageAPI, now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e := p.entries[name]; e != nil {
+		e.probing, e.probeAt = false, now
+		if data != nil {
+			e.probe = data
+		}
+	}
+}
+
 // snapshot returns the cached result for an account (nil, nil when never
 // fetched — e.g. API-key accounts, which are never polled).
 func (p *usagePoller) snapshot(name string) (*UsageAPI, string) {
@@ -389,6 +424,9 @@ func (p *usagePoller) snapshot(name string) (*UsageAPI, string) {
 	e := p.entries[name]
 	if e == nil {
 		return nil, ""
+	}
+	if e.data == nil && e.probe != nil {
+		return e.probe, ""
 	}
 	return e.data, e.err
 }
@@ -412,16 +450,16 @@ func (s *Server) pollUsageOnce(ctx context.Context) {
 			cancel()
 			s.usage.record(a.Name, data, err, time.Now())
 			if data != nil {
-				// Lets proactive switching see accounts not used lately.
-				var five, seven *float64
-				var fiveReset, sevenReset *time.Time
-				if w := data.FiveHour; w != nil {
-					five, fiveReset = &w.Pct, w.ResetsAt
-				}
-				if w := data.SevenDay; w != nil {
-					seven, sevenReset = &w.Pct, w.ResetsAt
-				}
-				s.sel.MarkUsageAPI(a.Name, five, fiveReset, seven, sevenReset, data.FetchedAt)
+				s.markWindows(a.Name, data)
+			}
+		}
+		if s.probe != nil {
+			var lastHeaders time.Time
+			if rl := s.sel.StatsSnapshot([]string{a.Name})[a.Name].RateLimits; rl != nil && rl.FiveHourPct != nil {
+				lastHeaders = rl.Seen
+			}
+			if s.usage.claimProbe(a.Name, time.Now(), lastHeaders) {
+				go s.runProbe(a.Name, a.Token)
 			}
 		}
 		if ctx.Err() == nil && s.usage.profileDue(a.Name, time.Now()) {
@@ -431,6 +469,35 @@ func (s *Server) pollUsageOnce(ctx context.Context) {
 			s.usage.recordProfile(a.Name, prof, err, time.Now())
 		}
 	}
+}
+
+// markWindows lets proactive switching see an account's windows from the
+// usage API or a probe, which (unlike response headers) also cover accounts
+// not used lately.
+func (s *Server) markWindows(name string, data *UsageAPI) {
+	var five, seven *float64
+	var fiveReset, sevenReset *time.Time
+	if w := data.FiveHour; w != nil {
+		five, fiveReset = &w.Pct, w.ResetsAt
+	}
+	if w := data.SevenDay; w != nil {
+		seven, sevenReset = &w.Pct, w.ResetsAt
+	}
+	s.sel.MarkUsageAPI(name, five, fiveReset, seven, sevenReset, data.FetchedAt)
+}
+
+// runProbe reads an account's windows with the Haiku probe.
+func (s *Server) runProbe(name, token string) {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	data, err := s.probe(ctx, token)
+	s.usage.recordProbe(name, data, time.Now())
+	if err != nil {
+		s.log.Warn("usage probe failed", "account", name, "err", err.Error())
+		return
+	}
+	s.markWindows(name, data)
+	s.log.Info("usage probe", "account", name)
 }
 
 // pollUsageLoop keeps usage warm while anyone is watching: one immediate

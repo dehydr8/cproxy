@@ -285,11 +285,17 @@ func accountMeters(a proxy.UsageAccount, now time.Time) []meterLine {
 		return "resets in " + countdown(*t, now)
 	}
 	if u := a.UsageAPI; u != nil {
+		note := func(s string) string { return s }
+		if u.Source == "probe" {
+			note = func(s string) string {
+				return strings.TrimSpace(s + " (Haiku probe " + agoString(&u.FetchedAt, now) + ")")
+			}
+		}
 		if w := u.FiveHour; w != nil {
-			out = append(out, meterLine{"5-hour", pct(w.Pct), reset(w.ResetsAt), w.Pct})
+			out = append(out, meterLine{"5-hour", pct(w.Pct), note(reset(w.ResetsAt)), w.Pct})
 		}
 		if w := u.SevenDay; w != nil {
-			out = append(out, meterLine{"7-day", pct(w.Pct), reset(w.ResetsAt), w.Pct})
+			out = append(out, meterLine{"7-day", pct(w.Pct), note(reset(w.ResetsAt)), w.Pct})
 		}
 		for _, sc := range u.Scoped {
 			out = append(out, meterLine{sc.Name, pct(sc.Pct), reset(sc.ResetsAt), sc.Pct})
