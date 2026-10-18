@@ -55,13 +55,22 @@ func init() {
 func runUsageCmd(cmd *cobra.Command, args []string) error {
 	// The local daemon answers over its private socket: no port, no token.
 	if !cmd.Flags().Changed("port") {
-		if c, st, err := daemon.Dial(); err == nil {
-			body, err := c.Usage()
-			if err != nil {
+		c, st, err := daemon.Dial()
+		if err != nil {
+			// No daemon yet (nothing launched since boot or install): start
+			// it when there is a pool for it to serve.
+			if err := needAccounts(); err != nil {
 				return err
 			}
-			return showUsage(body, "daemon "+st.Addr)
+			if c, st, err = wrap.ConnectDaemon(os.Environ()); err != nil {
+				return err
+			}
 		}
+		body, err := c.Usage()
+		if err != nil {
+			return err
+		}
+		return showUsage(body, "daemon "+st.Addr)
 	}
 
 	file, err := config.Load()
@@ -102,6 +111,22 @@ func runUsageCmd(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("cproxy on %s answered %s: %s", addr, resp.Status, errorBody(body))
 	}
 	return showUsage(body, addr)
+}
+
+// needAccounts explains what to do when no pool accounts are configured.
+func needAccounts() error {
+	file, err := config.Load()
+	if err != nil {
+		return err
+	}
+	rt, err := config.Build(file, os.Environ())
+	if err != nil {
+		return err
+	}
+	if len(rt.Accounts) == 0 {
+		return fmt.Errorf("no pool accounts are configured yet; add one with `cproxy accounts add NAME` (or set CPROXY_TOKEN_<NAME>), then `cproxy usage` shows them")
+	}
+	return nil
 }
 
 // showUsage prints a /usage?format=json body raw (--json) or as tables.

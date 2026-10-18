@@ -24,7 +24,7 @@ In an Amp orb the dashboard is also registered as the "cproxy usage" portal.`,
 		if err != nil {
 			return err
 		}
-		_, st, err := wrap.EnsureDaemon(os.Environ())
+		_, st, err := wrap.ConnectDaemon(os.Environ())
 		if err != nil {
 			return err
 		}
