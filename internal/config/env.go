@@ -164,13 +164,14 @@ func envAccounts(environ []string) ([]pool.Account, error) {
 
 // envClientTokens parses CPROXY_CLIENT_TOKENS into named specs.
 func envClientTokens(environ []string) map[string]ClientTokenSpec {
-	for _, kv := range environ {
-		k, v, ok := strings.Cut(kv, "=")
-		if ok && k == EnvClientTokens && v != "" {
-			return ClientTokensFromList(v)
+	var specs map[string]ClientTokenSpec
+	for _, e := range EnvClientTokenList(environ) {
+		if specs == nil {
+			specs = map[string]ClientTokenSpec{}
 		}
+		specs[e.Name] = e.Spec
 	}
-	return nil
+	return specs
 }
 
 // NamedClientToken is a client token together with the name it was
@@ -185,31 +186,54 @@ type NamedClientToken struct {
 func ClientTokenList(list string) []NamedClientToken {
 	var out []NamedClientToken
 	for _, e := range parseTokenList(list, "client") {
-		spec := ClientTokenSpec{Token: e.Token}
-		if tok, scopes, ok := strings.Cut(e.Token, ":"); ok {
-			spec.Token = strings.TrimSpace(tok)
-			for _, s := range strings.Split(scopes, "+") {
-				if s = strings.TrimSpace(s); s != "" {
-					spec.Scopes = append(spec.Scopes, s)
-				}
-			}
+		if spec := clientTokenSpec(e.Token); spec.Token != "" {
+			out = append(out, NamedClientToken{Name: e.Name, Spec: spec})
 		}
-		if spec.Token == "" {
-			continue
-		}
-		out = append(out, NamedClientToken{Name: e.Name, Spec: spec})
 	}
 	return out
 }
 
-// EnvClientTokenList returns the CPROXY_CLIENT_TOKENS entries in list order.
-func EnvClientTokenList(environ []string) []NamedClientToken {
-	for _, kv := range environ {
-		if k, v, ok := strings.Cut(kv, "="); ok && k == EnvClientTokens && v != "" {
-			return ClientTokenList(v)
+// clientTokenSpec parses "token[:scope+scope]".
+func clientTokenSpec(v string) ClientTokenSpec {
+	spec := ClientTokenSpec{Token: strings.TrimSpace(v)}
+	if tok, scopes, ok := strings.Cut(spec.Token, ":"); ok {
+		spec.Token = strings.TrimSpace(tok)
+		for _, s := range strings.Split(scopes, "+") {
+			if s = strings.TrimSpace(s); s != "" {
+				spec.Scopes = append(spec.Scopes, s)
+			}
 		}
 	}
-	return nil
+	return spec
+}
+
+// EnvClientTokenList returns the environment's client tokens in order: the
+// CPROXY_CLIENT_TOKENS list, then CPROXY_CLIENT_TOKEN_<NAME>=token[:scopes]
+// variables by name (client "<name>", lowercased). When a name repeats, the
+// per-client variable wins.
+func EnvClientTokenList(environ []string) []NamedClientToken {
+	var list, single []NamedClientToken
+	for _, kv := range environ {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || v == "" {
+			continue
+		}
+		switch {
+		case k == EnvClientTokens:
+			list = ClientTokenList(v)
+		case strings.HasPrefix(k, EnvClientTokenPrefix) && len(k) > len(EnvClientTokenPrefix):
+			if spec := clientTokenSpec(v); spec.Token != "" {
+				single = append(single, NamedClientToken{Name: strings.ToLower(k[len(EnvClientTokenPrefix):]), Spec: spec})
+			}
+		}
+	}
+	slices.SortFunc(single, func(a, b NamedClientToken) int { return strings.Compare(a.Name, b.Name) })
+	out := list
+	for _, e := range single {
+		out = slices.DeleteFunc(out, func(x NamedClientToken) bool { return x.Name == e.Name })
+		out = append(out, e)
+	}
+	return out
 }
 
 // EnvAuthToken returns CPROXY_AUTH_TOKEN from environ, or "".

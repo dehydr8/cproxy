@@ -27,6 +27,7 @@ type accountRow struct {
 	Name        string
 	Email       string // from the profile API when the token may read it
 	Org         string
+	Plan        string // "Max 20x", "Team · 5x"
 	Initials    string
 	Hue         int
 	Type        string
@@ -114,7 +115,7 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
     {{range .Accounts}}
     <tr data-account="{{.Name}}">
       <td><span class="identity"><span class="avatar hue-{{.Hue}}" aria-hidden="true">{{.Initials}}</span>
-        <span class="identity-copy"><span class="identity-name">{{.Name}}{{range .Pools}} <span class="chip chip-tag">{{.}}</span>{{end}}</span>
+        <span class="identity-copy"><span class="identity-name">{{.Name}}{{if .Plan}} <span class="chip chip-plan">{{.Plan}}</span>{{end}}{{range .Pools}} <span class="chip chip-tag">{{.}}</span>{{end}}</span>
         <span class="identity-sub">{{if .Email}}{{.Email}}{{else}}{{.Type}} token{{end}}</span></span></span></td>
       <td><span class="badge{{if .Tone}} {{.Tone}}{{end}}">{{.State}}</span></td>
       <td class="fill usage">
@@ -125,7 +126,7 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
         </div>{{end}}
         {{if .Spend}}<div class="note">{{.Spend}}</div>{{end}}
         {{if .UsageNote}}<div class="note">{{.UsageNote}}</div>{{end}}
-        {{if .HeaderNote}}<div class="note">from response headers: {{.HeaderNote}}</div>{{end}}
+        {{if .HeaderNote}}<div class="note">from response headers{{if not .Meters}}:{{end}} {{.HeaderNote}}</div>{{end}}
         {{if not (or .Meters .Spend .UsageNote .HeaderNote)}}<span class="faint">no usage seen yet</span>{{end}}
       </td>
       <td class="num">{{.Requests}}</td>
@@ -276,7 +277,7 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 			row.LastUsedAt = stt.LastUsed.Format(time.RFC3339)
 		}
 		if prof := s.usage.profile(a.Name); prof != nil {
-			row.Email, row.Org = prof.Email, prof.Organization
+			row.Email, row.Org, row.Plan = prof.Email, prof.Organization, prof.Plan
 		}
 		row.Initials, row.Hue = avatarFor(row.Name, row.Email)
 		switch {
@@ -314,8 +315,20 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 			}
 		} else {
 			row.UsageNote = apiErr
-			if stt.RateLimits != nil {
-				row.HeaderNote = RateLimitsSummary(stt.RateLimits, now)
+			if rl := stt.RateLimits; rl != nil {
+				// Without the usage API, the subscription windows from the
+				// last response headers still make meters.
+				if rl.FiveHourPct != nil {
+					row.Meters = append(row.Meters, newMeter("5-hour", *rl.FiveHourPct, rl.FiveHourReset, now))
+				}
+				if rl.SevenDayPct != nil {
+					row.Meters = append(row.Meters, newMeter("7-day", *rl.SevenDayPct, rl.SevenDayReset, now))
+				}
+				if len(row.Meters) > 0 {
+					row.HeaderNote = "as of the last response " + ago(rl.Seen)
+				} else {
+					row.HeaderNote = RateLimitsSummary(rl, now)
+				}
 			}
 		}
 		data.Requests += stt.Requests
@@ -438,6 +451,7 @@ type UsageAccount struct {
 	Name         string              `json:"name"`
 	Email        string              `json:"email,omitempty"`        // from the profile API
 	Organization string              `json:"organization,omitempty"` // from the profile API
+	Plan         string              `json:"plan,omitempty"`         // from the profile API
 	Type         string              `json:"type"`
 	Pools        []string            `json:"pools"`
 	Token        string              `json:"token"` // masked
@@ -521,7 +535,7 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 			Disabled:    a.Disabled,
 		}
 		if prof := s.usage.profile(a.Name); prof != nil {
-			row.Email, row.Organization = prof.Email, prof.Organization
+			row.Email, row.Organization, row.Plan = prof.Email, prof.Organization, prof.Plan
 		}
 		if !stt.LastUsed.IsZero() {
 			t := stt.LastUsed
@@ -579,6 +593,12 @@ func RateLimitsSummary(rl *pool.RateLimitInfo, now time.Time) string {
 	var parts []string
 	if rl.Status != "" && rl.Status != "allowed" {
 		parts = append(parts, rl.Status)
+	}
+	if rl.FiveHourPct != nil {
+		parts = append(parts, "5h "+pctStr(*rl.FiveHourPct))
+	}
+	if rl.SevenDayPct != nil {
+		parts = append(parts, "7d "+pctStr(*rl.SevenDayPct))
 	}
 	if rl.RequestsRemaining != nil || rl.RequestsLimit != nil {
 		parts = append(parts, "req "+compactNum(rl.RequestsRemaining)+"/"+compactNum(rl.RequestsLimit))

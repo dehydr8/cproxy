@@ -316,24 +316,102 @@ func TestAllAccounts429(t *testing.T) {
 	}
 }
 
-func TestRateLimitCooldownUsesUnifiedReset(t *testing.T) {
+func TestRateLimitCooldown(t *testing.T) {
 	reset := time.Now().Add(3 * time.Hour).Truncate(time.Second)
+	epoch := strconv.FormatInt(reset.Unix(), 10)
+	for _, tc := range []struct {
+		name    string
+		headers map[string]string
+		min     time.Duration // cooldown bounds, from now
+		max     time.Duration
+		exactly *time.Time
+	}{
+		{
+			// Subscription exhausted: no Retry-After, only the unified reset.
+			name:    "exhausted subscription waits for its reset",
+			headers: map[string]string{"Anthropic-Ratelimit-Unified-Status": "rejected", "Anthropic-Ratelimit-Unified-Reset": epoch},
+			exactly: &reset,
+		},
+		{
+			// The reset is sent on every response; a 429 that is not the
+			// subscription running out must not bench the account until it.
+			name:    "other 429 with a reset header pauses briefly",
+			headers: map[string]string{"Anthropic-Ratelimit-Unified-Status": "allowed", "Anthropic-Ratelimit-Unified-Reset": epoch},
+			min:     briefCooldown - 2*time.Second, max: briefCooldown + 2*time.Second,
+		},
+		{
+			name:    "other 429 honors Retry-After",
+			headers: map[string]string{"Retry-After": "90"},
+			min:     88 * time.Second, max: 92 * time.Second,
+		},
+		{
+			name:    "exhausted without a reset falls back",
+			headers: map[string]string{"Anthropic-Ratelimit-Unified-Status": "rejected"},
+			min:     exhaustedCooldown - 2*time.Second, max: exhaustedCooldown + 2*time.Second,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up := newFakeUpstream(t, func(w http.ResponseWriter, h hit) {
+				for k, v := range tc.headers {
+					w.Header().Set(k, v)
+				}
+				w.WriteHeader(429)
+			})
+			sel := pool.NewSelector()
+			accts := []pool.Account{{Name: "a", Token: "tokA"}}
+			clients := map[string]config.ClientAuth{"cp_alice": {Name: "alice"}}
+			ts := newProxy(t, up.URL, testRuntime(accts, clients), "", func(o *Options) { o.Selector = sel })
+
+			if resp := doReq(t, "POST", ts.URL+"/v1/messages", aliceHeaders(), "{}"); resp.StatusCode != 429 {
+				t.Fatalf("got %d, want 429", resp.StatusCode)
+			}
+			got := sel.StatsSnapshot([]string{"a"})["a"].CoolingUntil
+			if tc.exactly != nil {
+				if !got.Equal(*tc.exactly) {
+					t.Fatalf("cooling until %v, want %v", got, *tc.exactly)
+				}
+				return
+			}
+			if d := time.Until(got); d < tc.min || d > tc.max {
+				t.Fatalf("cooldown %v, want between %v and %v", d.Round(time.Second), tc.min, tc.max)
+			}
+		})
+	}
+}
+
+func TestBare429DoesNotBenchPool(t *testing.T) {
+	// The real shape of an OAuth refusal (here: a request without Claude
+	// Code's system prompt): 429, no rate-limit headers, no Retry-After.
 	up := newFakeUpstream(t, func(w http.ResponseWriter, h hit) {
-		// Subscription limits: no Retry-After, only the unified reset epoch.
-		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
-		w.Header().Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(reset.Unix(), 10))
-		w.WriteHeader(429)
+		if h.body == "bare" {
+			w.Header().Set("X-Should-Retry", "true")
+			w.WriteHeader(429)
+			io.WriteString(w, `{"type":"error","error":{"type":"rate_limit_error","message":"Error"}}`)
+			return
+		}
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "allowed")
+		w.WriteHeader(200)
 	})
 	sel := pool.NewSelector()
-	accts := []pool.Account{{Name: "a", Token: "tokA"}}
+	accts := []pool.Account{{Name: "a", Token: "tokA"}, {Name: "b", Token: "tokB"}}
 	clients := map[string]config.ClientAuth{"cp_alice": {Name: "alice"}}
 	ts := newProxy(t, up.URL, testRuntime(accts, clients), "", func(o *Options) { o.Selector = sel })
 
-	if resp := doReq(t, "POST", ts.URL+"/v1/messages", aliceHeaders(), "{}"); resp.StatusCode != 429 {
-		t.Fatalf("got %d, want 429", resp.StatusCode)
+	resp := doReq(t, "POST", ts.URL+"/v1/messages", aliceHeaders(), "bare")
+	if resp.StatusCode != 429 {
+		t.Fatalf("bare request: %d, want the upstream 429 passed through", resp.StatusCode)
 	}
-	if got := sel.StatsSnapshot([]string{"a"})["a"].CoolingUntil; !got.Equal(reset) {
-		t.Fatalf("cooling until %v, want the unified reset %v", got, reset)
+	if b, _ := io.ReadAll(resp.Body); !strings.Contains(string(b), `"message":"Error"`) {
+		t.Fatalf("client got %s, want the upstream body", b)
+	}
+	for name, st := range sel.StatsSnapshot([]string{"a", "b"}) {
+		if !st.CoolingUntil.IsZero() || st.RateLimited != 0 {
+			t.Fatalf("account %s benched by a bare 429: %+v", name, st)
+		}
+	}
+	// The pool is intact: the next normal request is served at once.
+	if resp := doReq(t, "POST", ts.URL+"/v1/messages", aliceHeaders(), "{}"); resp.StatusCode != 200 {
+		t.Fatalf("normal request after a bare 429: %d (%s)", resp.StatusCode, errType(t, resp))
 	}
 }
 
@@ -626,6 +704,14 @@ func TestUsageJSONAndRateLimits(t *testing.T) {
 		w.Header().Set("Anthropic-Ratelimit-Tokens-Limit", "40000")
 		w.Header().Set("Anthropic-Ratelimit-Tokens-Remaining", "38000")
 		w.Header().Set("Anthropic-Ratelimit-Tokens-Reset", "1920") // delta seconds
+		// Subscription windows, as real OAuth responses send them.
+		w.Header().Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.11")
+		w.Header().Set("Anthropic-Ratelimit-Unified-5h-Reset", "1792298400")
+		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Utilization", "0.07")
+		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Reset", "1792792800")
+		w.Header().Set("Anthropic-Ratelimit-Unified-Representative-Claim", "five_hour")
+		w.Header().Set("Anthropic-Ratelimit-Unified-Overage-Status", "rejected")
+		w.Header().Set("Anthropic-Ratelimit-Unified-Overage-Disabled-Reason", "org_spend_cap_reached")
 		w.WriteHeader(200)
 	})
 	accts := []pool.Account{{Name: "a", Token: "tokA"}}
@@ -646,9 +732,14 @@ func TestUsageJSONAndRateLimits(t *testing.T) {
 			Name       string `json:"name"`
 			Requests   int64  `json:"requests"`
 			RateLimits *struct {
-				Status            string `json:"status"`
-				RequestsRemaining *int64 `json:"requests_remaining"`
-				TokensRemaining   *int64 `json:"tokens_remaining"`
+				Status            string     `json:"status"`
+				RequestsRemaining *int64     `json:"requests_remaining"`
+				TokensRemaining   *int64     `json:"tokens_remaining"`
+				FiveHourPct       *float64   `json:"five_hour_pct"`
+				FiveHourReset     *time.Time `json:"five_hour_reset"`
+				SevenDayPct       *float64   `json:"seven_day_pct"`
+				Claim             string     `json:"claim"`
+				OverageReason     string     `json:"overage_reason"`
 			} `json:"rate_limits"`
 		} `json:"accounts"`
 		Clients []struct {
@@ -672,6 +763,11 @@ func TestUsageJSONAndRateLimits(t *testing.T) {
 		acc.RateLimits.TokensRemaining == nil || *acc.RateLimits.TokensRemaining != 38000 {
 		t.Fatalf("rate limits: %+v", acc.RateLimits)
 	}
+	if rl := acc.RateLimits; rl.FiveHourPct == nil || *rl.FiveHourPct != 11 || rl.FiveHourReset == nil ||
+		rl.FiveHourReset.Unix() != 1792298400 || rl.SevenDayPct == nil || *rl.SevenDayPct != 7 ||
+		rl.Claim != "five_hour" || rl.OverageReason != "org_spend_cap_reached" {
+		t.Fatalf("subscription windows: %+v", rl)
+	}
 	cli := doc.Clients[0]
 	if cli.Name != "alice" || cli.Pinned != "a" || cli.Requests != 1 {
 		t.Fatalf("client: %+v", cli)
@@ -679,7 +775,8 @@ func TestUsageJSONAndRateLimits(t *testing.T) {
 
 	frag := doReq(t, "GET", ts.URL+"/usage?fragment=1", aliceHeaders(), "")
 	b, _ := io.ReadAll(frag.Body)
-	for _, want := range []string{"req 42/50", "tok 38.0k/40.0k", "reset req 5m/tok 32m"} {
+	// Subscription windows from the headers become meters on the dashboard.
+	for _, want := range []string{"5-hour", "11%", "7-day", "7%", "from response headers as of the last response"} {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("fragment missing %q:\n%s", want, b)
 		}

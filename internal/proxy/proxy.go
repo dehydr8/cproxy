@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -300,8 +301,21 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 			drainClose(resp)
 			continue
 		}
+		if resp.StatusCode == http.StatusTooManyRequests && !isRateLimit(resp.Header) {
+			// A refusal of this request, not a limit on the account: try the
+			// others (an API-key member may serve it) without benching any.
+			s.log.Info("upstream refused the request with a bare 429; not benching the account",
+				"account", acct.Name, "can_retry", replay)
+			if !replay {
+				s.copyResponse(rec, resp)
+				s.logDone(r, rec, ca, pn, acct.Name, start)
+				return
+			}
+			held = captureHeld(resp)
+			continue
+		}
 		if resp.StatusCode == http.StatusTooManyRequests {
-			until := rateLimitedUntil(resp, 10*time.Minute)
+			until := rateLimitedUntil(resp)
 			s.sel.MarkRateLimited(acct.Name, until)
 			s.log.Warn("account rate limited", "account", acct.Name,
 				"cooldown", until.Sub(time.Now()).Round(time.Second), "can_retry", replay)
@@ -507,21 +521,61 @@ func retryAfter(resp *http.Response, def time.Duration) time.Time {
 	return now.Add(def)
 }
 
-// rateLimitedUntil decides how long a 429'd account cools down: Retry-After
-// when present, else the subscription's unified reset time (sent on OAuth
-// responses as epoch seconds), else def. Capped at 24h like retryAfter.
-func rateLimitedUntil(resp *http.Response, def time.Duration) time.Time {
-	if strings.TrimSpace(resp.Header.Get("Retry-After")) != "" {
-		return retryAfter(resp, def)
+// isRateLimit reports whether a 429 is an actual rate limit, i.e. carries
+// Retry-After or anthropic-ratelimit-* headers. OAuth tokens also get a bare
+// 429 (rate_limit_error "Error", neither header) for requests Anthropic will
+// not serve on them, such as ones without Claude Code's system prompt; that
+// says nothing about the account, which keeps serving normal requests.
+func isRateLimit(h http.Header) bool {
+	if strings.TrimSpace(h.Get("Retry-After")) != "" {
+		return true
 	}
-	now := time.Now()
-	if t, ok := headerReset(resp.Header, "Anthropic-Ratelimit-Unified-Reset"); ok && t.After(now) {
-		if limit := now.Add(24 * time.Hour); t.After(limit) {
-			return limit
+	for k := range h {
+		if strings.HasPrefix(http.CanonicalHeaderKey(k), "Anthropic-Ratelimit-") {
+			return true
 		}
-		return t
 	}
-	return now.Add(def)
+	return false
+}
+
+// Cooldowns after a 429.
+const (
+	// exhaustedCooldown applies when the subscription reports itself
+	// exhausted but sends no reset time.
+	exhaustedCooldown = 10 * time.Minute
+	// briefCooldown applies to any other 429 without Retry-After: a
+	// short-term or request-specific limit says little about the account,
+	// so it must not bench it for long.
+	briefCooldown = 30 * time.Second
+)
+
+// rateLimitedUntil decides how long a 429'd account cools down:
+//
+//   - the subscription itself is exhausted (unified-status "rejected"):
+//     until anthropic-ratelimit-unified-reset, else Retry-After, else
+//     exhaustedCooldown;
+//   - any other 429: Retry-After when present, else briefCooldown.
+//
+// Cooldowns are capped at 24h.
+func rateLimitedUntil(resp *http.Response) time.Time {
+	now := time.Now()
+	hasRetryAfter := strings.TrimSpace(resp.Header.Get("Retry-After")) != ""
+	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("Anthropic-Ratelimit-Unified-Status")), "rejected") {
+		if t, ok := headerReset(resp.Header, "Anthropic-Ratelimit-Unified-Reset"); ok && t.After(now) {
+			if limit := now.Add(24 * time.Hour); t.After(limit) {
+				return limit
+			}
+			return t
+		}
+		if hasRetryAfter {
+			return retryAfter(resp, exhaustedCooldown)
+		}
+		return now.Add(exhaustedCooldown)
+	}
+	if hasRetryAfter {
+		return retryAfter(resp, briefCooldown)
+	}
+	return now.Add(briefCooldown)
 }
 
 // parseRateLimits extracts an Anthropic rate-limit snapshot from response
@@ -546,8 +600,25 @@ func parseRateLimits(h http.Header) *pool.RateLimitInfo {
 	if t, ok := headerReset(h, "Anthropic-Ratelimit-Tokens-Reset"); ok {
 		info.TokensReset = &t
 	}
+	// Subscription windows report utilization as a 0–1 fraction.
+	if v, ok := headerFraction(h, "Anthropic-Ratelimit-Unified-5h-Utilization"); ok {
+		info.FiveHourPct = &v
+	}
+	if t, ok := headerReset(h, "Anthropic-Ratelimit-Unified-5h-Reset"); ok {
+		info.FiveHourReset = &t
+	}
+	if v, ok := headerFraction(h, "Anthropic-Ratelimit-Unified-7d-Utilization"); ok {
+		info.SevenDayPct = &v
+	}
+	if t, ok := headerReset(h, "Anthropic-Ratelimit-Unified-7d-Reset"); ok {
+		info.SevenDayReset = &t
+	}
+	info.Claim = strings.TrimSpace(h.Get("Anthropic-Ratelimit-Unified-Representative-Claim"))
+	info.OverageStatus = strings.TrimSpace(h.Get("Anthropic-Ratelimit-Unified-Overage-Status"))
+	info.OverageReason = strings.TrimSpace(h.Get("Anthropic-Ratelimit-Unified-Overage-Disabled-Reason"))
 	if info.Status == "" && info.RequestsLimit == nil && info.RequestsRemaining == nil &&
-		info.RequestsReset == nil && info.TokensLimit == nil && info.TokensRemaining == nil && info.TokensReset == nil {
+		info.RequestsReset == nil && info.TokensLimit == nil && info.TokensRemaining == nil && info.TokensReset == nil &&
+		info.FiveHourPct == nil && info.SevenDayPct == nil {
 		return nil
 	}
 	info.Seen = time.Now()
@@ -565,6 +636,15 @@ func headerInt(h http.Header, key string) (int64, bool) {
 		return 0, false
 	}
 	return n, true
+}
+
+// headerFraction reads a 0–1 utilization header as a percentage.
+func headerFraction(h http.Header, key string) (float64, bool) {
+	v, err := strconv.ParseFloat(strings.TrimSpace(h.Get(key)), 64)
+	if err != nil {
+		return 0, false
+	}
+	return math.Round(v*1000) / 10, true // one decimal, like the usage API
 }
 
 // headerReset parses a reset header. Anthropic sends RFC3339 timestamps;

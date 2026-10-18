@@ -117,7 +117,7 @@ func TestUsageAPIPollerPreferredOverHeaders(t *testing.T) {
 			return
 		}
 		if h.path == profileAPIPath {
-			io.WriteString(w, `{"account": {"uuid": "u1", "email": "main@example.com"}, "organization": {"name": "Acme"}}`)
+			io.WriteString(w, `{"account": {"uuid": "u1", "email": "main@example.com"}, "organization": {"name": "Acme", "organization_type": "claude_max", "rate_limit_tier": "default_claude_max_20x"}}`)
 			return
 		}
 		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "allowed")
@@ -205,7 +205,7 @@ func TestUsageAPIPollerPreferredOverHeaders(t *testing.T) {
 	// The dashboard renders the real numbers.
 	frag := doReq(t, "GET", ts.URL+"/usage?fragment=1", bearerHeaders("cp_alice"), "")
 	b, _ := io.ReadAll(frag.Body)
-	for _, want := range []string{"42.5%", "12%", "$25.50 / $500.00", "Fable", "20%", "main@example.com"} {
+	for _, want := range []string{"42.5%", "12%", "$25.50 / $500.00", "Fable", "20%", "main@example.com", "Max 20x"} {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("fragment missing %q:\n%s", want, b)
 		}

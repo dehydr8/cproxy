@@ -291,7 +291,17 @@ type RateLimitInfo struct {
 	TokensLimit       *int64     `json:"tokens_limit,omitempty"`
 	TokensRemaining   *int64     `json:"tokens_remaining,omitempty"`
 	TokensReset       *time.Time `json:"tokens_reset,omitempty"`
-	Seen              time.Time  `json:"seen"`
+
+	// Subscription windows (OAuth accounts): anthropic-ratelimit-unified-*.
+	FiveHourPct   *float64   `json:"five_hour_pct,omitempty"` // 0–100
+	FiveHourReset *time.Time `json:"five_hour_reset,omitempty"`
+	SevenDayPct   *float64   `json:"seven_day_pct,omitempty"`
+	SevenDayReset *time.Time `json:"seven_day_reset,omitempty"`
+	Claim         string     `json:"claim,omitempty"`          // the window that binds: five_hour, seven_day…
+	OverageStatus string     `json:"overage_status,omitempty"` // extra usage: allowed / rejected
+	OverageReason string     `json:"overage_reason,omitempty"` // e.g. org_spend_cap_reached
+
+	Seen time.Time `json:"seen"`
 }
 
 // MarkRateLimits records the last rate-limit headers seen for an account.

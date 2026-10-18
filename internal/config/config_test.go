@@ -228,6 +228,36 @@ func TestEnvPerAccountTokens(t *testing.T) {
 	}
 }
 
+func TestEnvPerClientTokens(t *testing.T) {
+	environ := []string{
+		"CPROXY_CLIENT_TOKEN_BOB=cp_bob",
+		"CPROXY_CLIENT_TOKENS=alice:cp_alice_list,carol:cp_carol",
+		"CPROXY_CLIENT_TOKEN_ALICE=cp_alice_own", // beats the list entry
+		"CPROXY_CLIENT_TOKEN_MONITOR=cp_mon:usage",
+	}
+	var got []string
+	for _, e := range EnvClientTokenList(environ) {
+		got = append(got, e.Name+"="+e.Spec.Token)
+	}
+	want := []string{"carol=cp_carol", "alice=cp_alice_own", "bob=cp_bob", "monitor=cp_mon"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("client tokens = %v, want %v", got, want)
+	}
+	rt, err := Build(&FileConfig{}, environ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rt.ClientAuth["cp_alice_list"]; ok {
+		t.Fatal("superseded list token still accepted")
+	}
+	if mon := rt.ClientAuth["cp_mon"]; mon.Name != "monitor" || mon.HasScope(ScopeProxy) || !mon.HasScope(ScopeUsage) {
+		t.Fatalf("monitor = %+v; want a usage-only client", mon)
+	}
+	if bob := rt.ClientAuth["cp_bob"]; bob.Name != "bob" || !bob.HasScope(ScopeProxy) {
+		t.Fatalf("bob = %+v", bob)
+	}
+}
+
 func TestBuildMergesEnvOverFile(t *testing.T) {
 	file := &FileConfig{
 		Accounts: []pool.Account{{Name: "main", Token: "file-tok", Pools: []string{"cvp"}}},

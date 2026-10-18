@@ -190,6 +190,7 @@ td.usage { white-space: normal; padding-top: 10px; padding-bottom: 10px; min-wid
   border-radius: 5px; font-size: 11.5px; white-space: nowrap;
 }
 .chip-tag { font-family: var(--mono); background: var(--muted); color: var(--foreground); }
+.chip-plan { border: 1px solid color-mix(in oklab, var(--primary) 35%, transparent); color: var(--primary); font-weight: 500; }
 
 /* Usage meters */
 .meters { display: grid; grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr)); gap: 8px 20px; }
