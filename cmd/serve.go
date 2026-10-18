@@ -58,7 +58,7 @@ environment variables are read once at startup. Run behind TLS (--tls-cert /
 func init() {
 	serveCmd.Flags().StringVar(&serveAddr, "addr", ":7788", "address to listen on")
 	serveCmd.Flags().StringVarP(&servePool, "pool", "p", "",
-		"pool to draw accounts from (default: the \"default\" pool)")
+		"pool for clients that do not name their own (default $CPROXY_POOL, else \"default\")")
 	serveCmd.Flags().StringVar(&serveStrategy, "strategy", "",
 		"override the pool's strategy ("+pool.Strategies()+")")
 	serveCmd.Flags().StringVar(&serveUpstream, "upstream", "",
@@ -102,10 +102,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		scheme = "https"
 	}
 
-	poolLabel := servePool
-	if poolLabel == "" {
-		poolLabel = config.DefaultPoolName
-	}
+	poolLabel := rt.SelectedPool()
 	log.Info("cproxy serving",
 		"version", version.String(),
 		"listen", scheme+"://"+ln.Addr().String(),
@@ -232,11 +229,13 @@ func buildServeState() (*proxy.State, *config.Runtime, error) {
 			config.EnvClientTokens, config.Path())
 	}
 
+	// --pool beats CPROXY_POOL; either one routes every client that does
+	// not name its own pool.
+	if servePool != "" {
+		rt.Pool = servePool
+	}
 	if serveStrategy != "" {
-		pn := servePool
-		if pn == "" {
-			pn = config.DefaultPoolName
-		}
+		pn := rt.SelectedPool()
 		if rt.Pools == nil {
 			rt.Pools = map[string]config.PoolConfig{}
 		}
@@ -245,7 +244,7 @@ func buildServeState() (*proxy.State, *config.Runtime, error) {
 		rt.Pools[pn] = pc
 	}
 
-	if _, _, err := rt.ResolvePool(servePool); err != nil {
+	if _, _, err := rt.ResolvePool(""); err != nil {
 		return nil, nil, err
 	}
 	return &proxy.State{Runtime: rt, NoAuth: serveNoAuth}, rt, nil

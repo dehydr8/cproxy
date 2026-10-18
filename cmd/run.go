@@ -50,7 +50,7 @@ Examples:
 
 func init() {
 	runCmd.Flags().StringVarP(&runPool, "pool", "p", "",
-		"pool to draw accounts from (default: the \"default\" pool)")
+		"pool to draw accounts from (default $CPROXY_POOL, else \"default\")")
 	runCmd.Flags().StringVar(&runStrategy, "strategy", "",
 		"override the pool's strategy ("+pool.Strategies()+")")
 	runCmd.Flags().StringVar(&runUpstream, "upstream", "",
@@ -74,10 +74,13 @@ func runRun(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	members, strategy, err := rt.ResolvePool(runPool)
+	if runPool != "" {
+		rt.Pool = runPool // --pool beats CPROXY_POOL
+	}
+	members, strategy, err := rt.ResolvePool("")
 	if err != nil {
 		return fmt.Errorf("%w\nadd accounts with: cproxy accounts add NAME --pool %s",
-			err, poolFlagOrDefault())
+			err, rt.SelectedPool())
 	}
 	if runStrategy != "" {
 		strategy, _ = pool.ParseStrategy(runStrategy)
@@ -130,7 +133,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 	log.Info("cproxy started",
 		"version", version.String(),
 		"listen", baseURL,
-		"pool", poolFlagOrDefault(),
+		"pool", rt.SelectedPool(),
 		"accounts", len(members),
 		"strategy", string(strategy),
 		"upstream", upstream.String(),
@@ -151,14 +154,6 @@ func runRun(cmd *cobra.Command, args []string) error {
 		os.Exit(code)
 	}
 	return nil
-}
-
-// poolFlagOrDefault returns the effective pool name for messages.
-func poolFlagOrDefault() string {
-	if runPool != "" {
-		return runPool
-	}
-	return config.DefaultPoolName
 }
 
 // childCommand resolves the wrapped command: everything after "--" (or all

@@ -75,3 +75,29 @@ func TestWatchReloadsOnFileChange(t *testing.T) {
 	close(hup)
 	<-done
 }
+
+func TestBuildServeStatePoolSelection(t *testing.T) {
+	t.Setenv(config.EnvHome, t.TempDir())
+	t.Setenv("CPROXY_TOKEN_MAIN", "sk-ant-oat01-main")
+	t.Setenv("CPROXY_POOL_TOKEN_CVP_A", "sk-ant-oat01-a")
+	t.Setenv(config.EnvPoolName, "cvp")
+	oldTokens, oldPool := serveClientTokens, servePool
+	t.Cleanup(func() { serveClientTokens, servePool = oldTokens, oldPool })
+	serveClientTokens = "alice:cp_alice"
+
+	for _, tc := range []struct{ flag, want string }{
+		{"", "cvp-a"},       // CPROXY_POOL
+		{"default", "main"}, // --pool beats it
+	} {
+		servePool = tc.flag
+		st, _, err := buildServeState()
+		if err != nil {
+			t.Fatal(err)
+		}
+		alice := st.Runtime.ClientAuth["cp_alice"]
+		members, _, err := st.Runtime.ResolvePool(alice.Pool)
+		if err != nil || len(members) != 1 || members[0].Name != tc.want {
+			t.Fatalf("--pool %q: alice routes to %+v (%v); want %s", tc.flag, members, err, tc.want)
+		}
+	}
+}

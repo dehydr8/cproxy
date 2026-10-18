@@ -23,13 +23,16 @@ const (
 	EnvUpstreamName  = "CPROXY_UPSTREAM"      // upstream base URL override
 	EnvAuthTokenName = "CPROXY_AUTH_TOKEN"    // client token the claude wrapper presents
 	EnvPortName      = "CPROXY_PORT"          // port of the wrapper's shared serve instance
+	EnvPoolName      = "CPROXY_POOL"          // pool used when --pool is not given
+	EnvTokenPrefix   = "CPROXY_TOKEN_"        // + NAME → one default-pool account
+	EnvPoolTokenPref = "CPROXY_POOL_TOKEN_"   // + POOL_NAME → one account in POOL
 )
 
 // DefaultUpstream is the Anthropic API base URL used unless overridden.
 const DefaultUpstream = "https://api.anthropic.com"
 
-// DefaultPoolName is the pool used when --pool is not given. Accounts that
-// list no pools belong to it.
+// DefaultPoolName is the pool used when neither --pool nor CPROXY_POOL is
+// given. Accounts that list no pools belong to it.
 const DefaultPoolName = "default"
 
 // FileConfig is the on-disk shape of ~/.cproxy/credentials.json.
@@ -273,7 +276,24 @@ type Runtime struct {
 	Accounts    []pool.Account
 	Pools       map[string]PoolConfig
 	ClientAuth  map[string]ClientAuth // client token -> identity
-	DefaultPool string
+	DefaultPool string                // pool of accounts that list none
+	Pool        string                // pool for clients without their own (--pool, CPROXY_POOL); DefaultPool when empty
+}
+
+// SelectedPool is the pool requests use unless their client names another.
+func (rt *Runtime) SelectedPool() string {
+	if rt.Pool != "" {
+		return rt.Pool
+	}
+	return rt.DefaultPool
+}
+
+// PoolFor is the pool a client's requests draw from.
+func (rt *Runtime) PoolFor(ca ClientAuth) string {
+	if ca.Pool != "" {
+		return ca.Pool
+	}
+	return rt.SelectedPool()
 }
 
 // Build resolves the file config plus the process environment. Environment
@@ -285,6 +305,7 @@ func Build(file *FileConfig, environ []string) (*Runtime, error) {
 		Pools:       map[string]PoolConfig{},
 		ClientAuth:  map[string]ClientAuth{},
 		DefaultPool: DefaultPoolName,
+		Pool:        strings.ToLower(strings.TrimSpace(EnvPool(environ))),
 	}
 	for n, p := range file.Pools {
 		rt.Pools[n] = p
@@ -297,7 +318,11 @@ func Build(file *FileConfig, environ []string) (*Runtime, error) {
 		rt.ClientAuth[spec.Token] = ClientAuth{Name: n, Pool: spec.Pool, Scopes: scopes}
 	}
 
-	for _, a := range envAccounts(environ) {
+	envAccts, err := envAccounts(environ)
+	if err != nil {
+		return nil, err
+	}
+	for _, a := range envAccts {
 		if i := slices.IndexFunc(rt.Accounts, func(x pool.Account) bool { return x.Name == a.Name }); i >= 0 {
 			rt.Accounts[i] = a
 		} else {
@@ -387,12 +412,12 @@ func (rt *Runtime) PoolNames() []string {
 	return out
 }
 
-// ResolvePool returns the usable members of the named pool (the default pool
+// ResolvePool returns the usable members of the named pool (SelectedPool
 // when name is empty) together with its strategy. Disabled accounts are
 // excluded. An unknown pool name yields an error listing the known pools.
 func (rt *Runtime) ResolvePool(name string) ([]pool.Account, pool.Strategy, error) {
 	if name == "" {
-		name = rt.DefaultPool
+		name = rt.SelectedPool()
 	}
 	strategy := pool.DefaultStrategy
 	if pc, ok := rt.Pools[name]; ok {

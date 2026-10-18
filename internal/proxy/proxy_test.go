@@ -543,12 +543,12 @@ func TestUsageDashboard(t *testing.T) {
 	}
 	body, _ := io.ReadAll(page.Body)
 	for _, want := range []string{
-		"setInterval", // live-refresh wiring (inline, no third-party script)
-		"<td>a</td>",  // account rows
-		"<td>b</td>",
-		"cooling",        // a is cooling after its 429
-		"alice",          // client row
-		"token=cp_alice", // ?token= propagated into the fragment URL
+		"setInterval",      // live-refresh wiring (inline, no third-party script)
+		`data-account="a"`, // account rows
+		`data-account="b"`,
+		"cooling",             // a is cooling after its 429
+		`data-client="alice"`, // client row
+		"token=cp_alice",      // ?token= propagated into the fragment URL
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("usage page missing %q:\n%s", want, body)
@@ -564,7 +564,7 @@ func TestUsageDashboard(t *testing.T) {
 		t.Fatalf("fragment: %d", frag.StatusCode)
 	}
 	fb, _ := io.ReadAll(frag.Body)
-	if strings.Contains(string(fb), "<html") || !strings.Contains(string(fb), "<td>b</td>") {
+	if strings.Contains(string(fb), "<html") || !strings.Contains(string(fb), `data-account="b"`) {
 		t.Fatalf("fragment is not a table-only partial:\n%s", fb)
 	}
 
@@ -679,7 +679,7 @@ func TestUsageJSONAndRateLimits(t *testing.T) {
 
 	frag := doReq(t, "GET", ts.URL+"/usage?fragment=1", aliceHeaders(), "")
 	b, _ := io.ReadAll(frag.Body)
-	for _, want := range []string{"req 42/50", "tok 38.0k/40.0k", "reset req 5m0s/tok 32m0s"} {
+	for _, want := range []string{"req 42/50", "tok 38.0k/40.0k", "reset req 5m/tok 32m"} {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("fragment missing %q:\n%s", want, b)
 		}

@@ -25,8 +25,10 @@ Claude CLI (a "pool"). It never touches Claude's own files (~/.claude,
 Credentials live in ~/.cproxy/credentials.json ("accounts", optionally
 grouped into "pools") or in the environment:
 
-	CPROXY_TOKENS=main:sk-ant-oat01-…,alt:sk-ant-oat01-…
-	CPROXY_POOL_TOKENS_CVP=main:…,alt:…
+	CPROXY_TOKEN_MAIN=sk-ant-oat01-…           # one account per variable
+	CPROXY_POOL_TOKEN_CVP_A=sk-ant-oat01-…     # account "cvp-a" in pool cvp
+	CPROXY_POOL=cvp                            # pool used without --pool
+	CPROXY_TOKENS=main:sk-ant-oat01-…,alt:…    # or several in one list
 
 Quick start:
 
