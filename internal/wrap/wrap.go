@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/dehydr8/cproxy/internal/config"
 )
@@ -36,8 +37,14 @@ var (
 // `cproxy claude` on each launch, so config changes never need a reinstall.
 func ShimScript(cproxyPath, realClaude string) string {
 	return "#!/bin/sh\n" +
-		Marker + " (real binary: " + realClaude + "; installed by `cproxy install`)\n" +
-		"exec \"" + cproxyPath + "\" claude --exec \"" + realClaude + "\" -- \"$@\"\n"
+		Marker + " (real binary: " + strings.ReplaceAll(realClaude, "\n", " ") + "; installed by `cproxy install`)\n" +
+		"exec " + shQuote(cproxyPath) + " claude --exec " + shQuote(realClaude) + " -- \"$@\"\n"
+}
+
+// shQuote single-quotes s for sh, so paths with spaces, quotes, $ or
+// backticks reach exec verbatim.
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // IsShim reports whether path holds a shim written by Install.

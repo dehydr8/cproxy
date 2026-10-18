@@ -1,7 +1,7 @@
 // Usage dashboard: an auth-gated live page at /usage showing pool, account
 // and client activity, plus the rate-limit headers cproxy observes on
-// upstream responses. It refreshes itself with htmx (partial HTML swap every
-// 2s) and falls back to manual reload when htmx cannot load. `?format=json`
+// upstream responses. A small inline script swaps in the stats fragment
+// every 2s; without JavaScript the page is a static snapshot. `?format=json`
 // returns the same data machine-readable for scripts and agents.
 
 package proxy
@@ -115,22 +115,32 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
   td.disabled { color: #8896a6; }
   td.ok { color: #7fd4a8; }
 </style>
-<script src="https://unpkg.com/htmx.org@2" defer></script>
 </head>
 <body>
 <h1><span>cproxy</span> usage</h1>
-<main id="stats"
-      hx-get="/usage?fragment=1{{if .TokenParam}}&amp;token={{.TokenParam}}{{end}}"
-      hx-trigger="every 2s" hx-swap="innerHTML">
+<main id="stats" data-src="/usage?fragment=1{{if .TokenParam}}&amp;token={{.TokenParam}}{{end}}">
 {{template "stats" .}}
 </main>
+<script>
+// Swap in the stats fragment every 2s. Inline on purpose: this page may
+// carry its client token in the URL, so it loads no third-party script.
+(function () {
+  var el = document.getElementById("stats");
+  setInterval(function () {
+    fetch(el.dataset.src, {cache: "no-store"})
+      .then(function (r) { return r.ok ? r.text() : null; })
+      .then(function (html) { if (html !== null) el.innerHTML = html; })
+      .catch(function () {});
+  }, 2000);
+})();
+</script>
 </body>
 </html>
 {{end}}
 `))
 
 // serveUsage renders the dashboard: the full page, the stats-only fragment
-// (?fragment=1, for htmx polling) or machine-readable JSON (?format=json).
+// (?fragment=1, for the live refresh) or machine-readable JSON (?format=json).
 func (s *Server) serveUsage(w http.ResponseWriter, r *http.Request, st *State) {
 	s.ensureUsageWarm() // start the usage-API poller and let its first cycle land
 	if r.URL.Query().Get("format") == "json" {
@@ -150,6 +160,7 @@ func (s *Server) serveUsage(w http.ResponseWriter, r *http.Request, st *State) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer") // ?token= must not leak
 	if err := usageTmpl.ExecuteTemplate(w, name, data); err != nil {
 		s.log.Warn("usage render failed", "err", err.Error())
 	}

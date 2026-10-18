@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -218,9 +220,12 @@ func TestFailoverOn429WithSticky(t *testing.T) {
 		w.WriteHeader(200)
 		w.Write([]byte(`{"ok":true}`))
 	})
+	// Three accounts: after failing over to b, a fresh remap would rotate
+	// alice on to c, paying her context a third time.
 	accts := []pool.Account{
 		{Name: "a", Token: "tokA"},
 		{Name: "b", Token: "tokB"},
+		{Name: "c", Token: "tokC"},
 	}
 	clients := map[string]config.ClientAuth{"cp_alice": {Name: "alice"}}
 	ts := newProxy(t, up.URL, testRuntime(accts, clients), "", nil)
@@ -308,6 +313,83 @@ func TestAllAccounts429(t *testing.T) {
 	}
 	if ra := resp.Header.Get("Retry-After"); ra == "" || ra == "0" {
 		t.Fatalf("cooling Retry-After = %q", ra)
+	}
+}
+
+func TestRateLimitCooldownUsesUnifiedReset(t *testing.T) {
+	reset := time.Now().Add(3 * time.Hour).Truncate(time.Second)
+	up := newFakeUpstream(t, func(w http.ResponseWriter, h hit) {
+		// Subscription limits: no Retry-After, only the unified reset epoch.
+		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
+		w.Header().Set("Anthropic-Ratelimit-Unified-Reset", strconv.FormatInt(reset.Unix(), 10))
+		w.WriteHeader(429)
+	})
+	sel := pool.NewSelector()
+	accts := []pool.Account{{Name: "a", Token: "tokA"}}
+	clients := map[string]config.ClientAuth{"cp_alice": {Name: "alice"}}
+	ts := newProxy(t, up.URL, testRuntime(accts, clients), "", func(o *Options) { o.Selector = sel })
+
+	if resp := doReq(t, "POST", ts.URL+"/v1/messages", aliceHeaders(), "{}"); resp.StatusCode != 429 {
+		t.Fatalf("got %d, want 429", resp.StatusCode)
+	}
+	if got := sel.StatsSnapshot([]string{"a"})["a"].CoolingUntil; !got.Equal(reset) {
+		t.Fatalf("cooling until %v, want the unified reset %v", got, reset)
+	}
+}
+
+func TestClientCancelDoesNotBenchPool(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	up := newFakeUpstream(t, func(w http.ResponseWriter, h hit) {
+		if h.body == "slow" {
+			started <- struct{}{}
+			<-release
+			return
+		}
+		w.WriteHeader(200)
+	})
+	t.Cleanup(func() { close(release) }) // runs before up.Close
+	accts := []pool.Account{{Name: "a", Token: "tokA"}, {Name: "b", Token: "tokB"}}
+	clients := map[string]config.ClientAuth{"cp_alice": {Name: "alice"}}
+	ts := newProxy(t, up.URL, testRuntime(accts, clients), "", nil)
+
+	// The client gives up while the upstream is still thinking (Esc in Claude).
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, "POST", ts.URL+"/v1/messages", strings.NewReader("slow"))
+	req.Header.Set("Authorization", "Bearer cp_alice")
+	errc := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		errc <- err
+	}()
+	<-started
+	cancel()
+	<-errc
+
+	// Neither account was at fault: the next request must be served, by
+	// the account the client was already on.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp := doReq(t, "POST", ts.URL+"/v1/messages", aliceHeaders(), "{}")
+		if resp.StatusCode == 200 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("after a client cancel: %d (%s), want 200", resp.StatusCode, errType(t, resp))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	got := up.auths()
+	if got[len(got)-1] != "Bearer tokA" {
+		t.Fatalf("hits after cancel = %s; want the client kept on tokA", got)
+	}
+	for _, a := range got[1 : len(got)-1] {
+		if a != "Bearer tokA" {
+			t.Fatalf("canceled request was failed over: %s", got)
+		}
 	}
 }
 
@@ -461,9 +543,8 @@ func TestUsageDashboard(t *testing.T) {
 	}
 	body, _ := io.ReadAll(page.Body)
 	for _, want := range []string{
-		"htmx.org",   // live-refresh wiring
-		"every 2s",   // htmx poll trigger
-		"<td>a</td>", // account rows
+		"setInterval", // live-refresh wiring (inline, no third-party script)
+		"<td>a</td>",  // account rows
 		"<td>b</td>",
 		"cooling",        // a is cooling after its 429
 		"alice",          // client row
@@ -472,6 +553,10 @@ func TestUsageDashboard(t *testing.T) {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("usage page missing %q:\n%s", want, body)
 		}
+	}
+
+	if strings.Contains(string(body), "<script src") {
+		t.Fatalf("usage page loads an external script while carrying ?token=:\n%s", body)
 	}
 
 	frag := doReq(t, "GET", ts.URL+"/usage?fragment=1&token=cp_alice", nil, "")

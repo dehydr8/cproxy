@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/dehydr8/cproxy/internal/config"
+	"github.com/dehydr8/cproxy/internal/proxy"
 )
 
 // cannedSnapshot is a /usage?format=json body shaped like the real wire form.
@@ -53,6 +54,9 @@ func TestRunUsageCmd(t *testing.T) {
 
 	var gotAuth, gotPath string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if answerWhoami(w, r, "cp_usageview") {
+			return
+		}
 		gotAuth = r.Header.Get("Authorization")
 		gotPath = r.URL.Path + "?" + r.URL.RawQuery
 		io.WriteString(w, cannedSnapshot(time.Now()))
@@ -99,6 +103,9 @@ func TestRunUsageCmdForbidden(t *testing.T) {
 	t.Setenv("CPROXY_CLIENT_TOKENS", "mon:cp_localsaysyes")
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if answerWhoami(w, r, "cp_localsaysyes") {
+			return
+		}
 		w.WriteHeader(http.StatusForbidden)
 		io.WriteString(w, `{"type":"error","error":{"type":"permission_error","message":"cproxy: this token may not view usage (add the \"usage\" scope)"}}`)
 	}))
@@ -110,6 +117,18 @@ func TestRunUsageCmdForbidden(t *testing.T) {
 		!strings.Contains(err.Error(), "may not view usage") {
 		t.Fatalf("err = %v; want the server's permission message", err)
 	}
+}
+
+// answerWhoami serves the listener check with a real cproxy handler that
+// knows token, so fake servers pass for the instance holding it.
+func answerWhoami(w http.ResponseWriter, r *http.Request, token string) bool {
+	if r.URL.Path != proxy.WhoamiPath {
+		return false
+	}
+	u, _ := url.Parse("http://127.0.0.1:1")
+	rt := &config.Runtime{ClientAuth: map[string]config.ClientAuth{token: {Name: "t"}}}
+	proxy.New(proxy.Options{Upstream: u, State: &proxy.State{Runtime: rt}}).ServeHTTP(w, r)
+	return true
 }
 
 func portOf(t *testing.T, raw string) int {

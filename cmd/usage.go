@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/dehydr8/cproxy/internal/config"
 	"github.com/dehydr8/cproxy/internal/proxy"
+	"github.com/dehydr8/cproxy/internal/wrap"
 )
 
 var (
@@ -67,6 +69,12 @@ func runUsageCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	addr := fmt.Sprintf("127.0.0.1:%d", usagePortFlag)
+	if err := wrap.Verify(addr, token); err != nil {
+		if !listening(addr) {
+			return fmt.Errorf("no cproxy is answering on %s (is `cproxy serve` or the claude wrapper running? start one with `cproxy serve` or launch claude through the wrapper): %w", addr, err)
+		}
+		return err
+	}
 	req, err := http.NewRequest(http.MethodGet, "http://"+addr+"/usage?format=json", nil)
 	if err != nil {
 		return err
@@ -235,4 +243,14 @@ func envValue(environ []string, name string) string {
 		}
 	}
 	return ""
+}
+
+// listening reports whether anything accepts connections on addr.
+func listening(addr string) bool {
+	c, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	c.Close()
+	return true
 }

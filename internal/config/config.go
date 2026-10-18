@@ -307,6 +307,14 @@ func Build(file *FileConfig, environ []string) (*Runtime, error) {
 		rt.ClientAuth[spec.Token] = ClientAuth{Name: n, Pool: spec.Pool, Scopes: scopes}
 	}
 
+	// Hand-edited file accounts may omit "type"; the proxy must still send
+	// an API key as x-api-key, and only OAuth accounts get usage polling.
+	for i := range rt.Accounts {
+		if rt.Accounts[i].Type == "" {
+			rt.Accounts[i].Type = pool.DetectTokenType(rt.Accounts[i].Token)
+		}
+	}
+
 	if err := rt.validate(); err != nil {
 		return nil, err
 	}

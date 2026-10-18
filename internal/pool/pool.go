@@ -205,6 +205,14 @@ func (s *Selector) Assignment(poolName, clientID string) string {
 	return s.sticky[poolName+"|"+clientID]
 }
 
+// Pin moves a client's sticky assignment to account, e.g. after a failover
+// landed its request there.
+func (s *Selector) Pin(poolName, clientID, account string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sticky[poolName+"|"+clientID] = account
+}
+
 // MarkSuccess records a completed upstream request.
 func (s *Selector) MarkSuccess(name string) {
 	s.mu.Lock()
@@ -276,7 +284,7 @@ type ClientStats struct {
 // anthropic-ratelimit-* response headers. Pointer fields are set only when
 // the upstream actually sent that header.
 type RateLimitInfo struct {
-	Status            string     `json:"status,omitempty"` // unified-status: allowed/limited/blocked
+	Status            string     `json:"status,omitempty"` // unified-status: allowed/allowed_warning/rejected
 	RequestsLimit     *int64     `json:"requests_limit,omitempty"`
 	RequestsRemaining *int64     `json:"requests_remaining,omitempty"`
 	RequestsReset     *time.Time `json:"requests_reset,omitempty"`

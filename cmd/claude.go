@@ -102,7 +102,7 @@ func runClaude(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("a client token is configured but no pool accounts are; add accounts with `cproxy accounts add NAME` or set CPROXY_TOKENS (or run claude per-invocation with `cproxy run -- claude`)")
 	}
 
-	if _, err := wrap.EnsureServe(wrap.ServeOptions{Port: claudePort, Environ: os.Environ()}); err != nil {
+	if _, err := wrap.EnsureServe(wrap.ServeOptions{Port: claudePort, Environ: os.Environ(), Token: token}); err != nil {
 		return err
 	}
 

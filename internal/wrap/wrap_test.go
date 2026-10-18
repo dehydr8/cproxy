@@ -3,6 +3,7 @@ package wrap
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,11 +17,37 @@ func TestShimScript(t *testing.T) {
 	for _, want := range []string{
 		"#!/bin/sh\n",
 		Marker,
-		`exec "/usr/local/bin/cproxy" claude --exec "/home/u/.local/bin/claude.cproxy-real" -- "$@"`,
+		`exec '/usr/local/bin/cproxy' claude --exec '/home/u/.local/bin/claude.cproxy-real' -- "$@"`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("shim script missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestShimScriptOddPaths(t *testing.T) {
+	// The shim must hand both paths and claude's args to exec verbatim,
+	// whatever characters they contain.
+	dir := filepath.Join(t.TempDir(), `it's "a" $HOME `+"`x`"+` dir`)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fake := filepath.Join(dir, "cproxy")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nprintf '%s\\n' \"$@\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(dir, "claude.cproxy-real")
+	shim := filepath.Join(dir, "claude")
+	if err := os.WriteFile(shim, []byte(ShimScript(fake, real)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command(shim, "-p", "a b").Output()
+	if err != nil {
+		t.Fatalf("shim failed: %v", err)
+	}
+	want := strings.Join([]string{"claude", "--exec", real, "--", "-p", "a b"}, "\n") + "\n"
+	if string(out) != want {
+		t.Fatalf("shim passed:\n%s\nwant:\n%s", out, want)
 	}
 }
 

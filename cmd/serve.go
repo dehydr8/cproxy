@@ -47,8 +47,9 @@ Each client token may optionally route to its own pool:
 	"client_tokens": {"alice": {"token": "cp_…", "pool": "cvp"}}
 
 Client tokens never travel upstream: cproxy replaces the Authorization
-header with a pool account's credential. Send SIGHUP to reload
-credentials.json without dropping connections. Run behind TLS (--tls-cert /
+header with a pool account's credential. Changes to credentials.json are
+picked up automatically (or send SIGHUP) without dropping connections;
+environment variables are read once at startup. Run behind TLS (--tls-cert /
 --tls-key) or a terminating proxy when exposing this beyond localhost.`,
 	RunE: runServe,
 }
@@ -89,7 +90,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	srv := proxy.New(proxy.Options{Upstream: upstream, State: st, Log: newLogger()})
-	httpSrv := &http.Server{Handler: srv}
+	httpSrv := &http.Server{Handler: srv, ReadHeaderTimeout: 30 * time.Second}
 	log := newLogger()
 
 	scheme := "http"
@@ -113,14 +114,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 		"no_auth", serveNoAuth,
 		"upstream", upstream.String())
 
-	// SIGHUP reloads credentials.json (and the environment) without
-	// dropping connections; health state (cooldowns) survives.
+	// Editing credentials.json (e.g. `cproxy accounts add`) or SIGHUP
+	// reloads without dropping connections; health state (cooldowns)
+	// survives. The environment is fixed for the life of the process.
 	hup := make(chan os.Signal, 1)
 	launch.NotifyHUP(hup)
 	go func() {
-		for range hup {
-			reloadServe(srv, rt)
-		}
+		cur := rt
+		watchReloads(hup, config.Path(), credentialsPoll, func() {
+			if next := reloadServe(srv, cur); next != nil {
+				cur = next
+			}
+		})
 	}()
 
 	stop := make(chan os.Signal, 1)
@@ -145,6 +150,46 @@ func runServe(cmd *cobra.Command, args []string) error {
 	return err
 }
 
+// credentialsPoll is how often serve checks credentials.json for changes.
+const credentialsPoll = 2 * time.Second
+
+// fileStamp identifies one version of a file; the zero value means missing.
+type fileStamp struct {
+	mod  time.Time
+	size int64
+}
+
+func stampOf(path string) fileStamp {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileStamp{}
+	}
+	return fileStamp{fi.ModTime(), fi.Size()}
+}
+
+// watchReloads calls reload on every signal from hup and whenever path
+// changes (checked every interval). It returns when hup is closed.
+func watchReloads(hup <-chan os.Signal, path string, every time.Duration, reload func()) {
+	last := stampOf(path)
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case _, ok := <-hup:
+			if !ok {
+				return
+			}
+		case <-t.C:
+			if stampOf(path) == last {
+				continue
+			}
+			newLogger().Info("credentials file changed; reloading", "path", path)
+		}
+		last = stampOf(path)
+		reload()
+	}
+}
+
 // buildServeState resolves the file + env + flag configuration into the
 // proxy's request-time state.
 func buildServeState() (*proxy.State, *config.Runtime, error) {
@@ -159,12 +204,16 @@ func buildServeState() (*proxy.State, *config.Runtime, error) {
 
 	if serveClientTokens != "" {
 		for name, spec := range config.ClientTokensFromList(serveClientTokens) {
+			scopes, err := config.ParseScopes(spec.Scopes)
+			if err != nil {
+				return nil, nil, fmt.Errorf("--client-tokens %q: %w", name, err)
+			}
 			for tok, ca := range rt.ClientAuth {
 				if ca.Name == name {
 					delete(rt.ClientAuth, tok)
 				}
 			}
-			rt.ClientAuth[spec.Token] = config.ClientAuth{Name: name, Pool: spec.Pool}
+			rt.ClientAuth[spec.Token] = config.ClientAuth{Name: name, Pool: spec.Pool, Scopes: scopes}
 		}
 	}
 	if len(rt.ClientAuth) == 0 && !serveNoAuth {
@@ -196,12 +245,14 @@ func buildServeState() (*proxy.State, *config.Runtime, error) {
 
 // reloadServe rebuilds the state on SIGHUP and swaps it in, keeping the old
 // one on any error. Health state for accounts whose token changed is reset.
-func reloadServe(srv *proxy.Server, old *config.Runtime) {
+// It returns the new runtime (nil on error) so the next reload diffs
+// against what is actually being served.
+func reloadServe(srv *proxy.Server, old *config.Runtime) *config.Runtime {
 	log := newLogger()
 	st, rt, err := buildServeState()
 	if err != nil {
 		log.Error("reload failed; keeping previous config", "err", err.Error())
-		return
+		return nil
 	}
 	oldByName := map[string]pool.Account{}
 	if old != nil {
@@ -211,9 +262,10 @@ func reloadServe(srv *proxy.Server, old *config.Runtime) {
 	}
 	for _, a := range rt.Accounts {
 		if prev, ok := oldByName[a.Name]; ok && prev.Token != a.Token {
-			srv.Selector().ClearAccount(a.Name)
+			srv.ForgetAccount(a.Name)
 		}
 	}
 	srv.Update(st)
 	log.Info("reloaded", "accounts", len(rt.Accounts), "clients", len(rt.ClientAuth))
+	return rt
 }

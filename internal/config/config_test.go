@@ -197,6 +197,26 @@ func TestBuildMergesEnvOverFile(t *testing.T) {
 	}
 }
 
+func TestBuildDetectsMissingType(t *testing.T) {
+	// A hand-edited file may omit "type": the API key must still go out as
+	// x-api-key, not as a bearer token.
+	file := &FileConfig{Accounts: []pool.Account{
+		{Name: "key", Token: "sk-ant-api03-x"},
+		{Name: "sub", Token: "sk-ant-oat01-x"},
+		{Name: "forced", Token: "sk-ant-api03-y", Type: pool.TokenTypeOAuth},
+	}}
+	rt, err := Build(file, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]pool.TokenType{"key": pool.TokenTypeAPI, "sub": pool.TokenTypeOAuth, "forced": pool.TokenTypeOAuth}
+	for _, a := range rt.Accounts {
+		if a.Type != want[a.Name] {
+			t.Fatalf("account %q type = %q, want %q", a.Name, a.Type, want[a.Name])
+		}
+	}
+}
+
 func TestResolvePool(t *testing.T) {
 	rt := &Runtime{
 		Accounts: []pool.Account{

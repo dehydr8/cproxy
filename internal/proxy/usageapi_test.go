@@ -19,11 +19,12 @@ import (
 
 // cannedUsageAPI is the wire shape of GET /api/oauth/usage (as seen by
 // claude-swap): percentage utilization windows, optional spend and
-// per-model weekly limits. monthly_limit may be null; resets_at may be null.
+// per-model weekly limits. Credit amounts are in cents; monthly_limit may be
+// null; resets_at may be null.
 const cannedUsageAPI = `{
   "five_hour":  {"utilization": 42.5, "resets_at": "2026-10-18T00:00:00Z"},
   "seven_day":  {"utilization": 12,   "resets_at": "2026-10-20T00:00:00Z"},
-  "extra_usage": {"is_enabled": true, "used_credits": 25.5, "monthly_limit": 500,
+  "extra_usage": {"is_enabled": true, "used_credits": 2550, "monthly_limit": 50000,
                   "utilization": 5.1, "currency": "USD", "resets_at": null},
   "limits": [
     {"scope": {"model": {"display_name": "Fable"}}, "percent": 20,

@@ -2,15 +2,24 @@ package wrap
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/dehydr8/cproxy/internal/config"
+	"github.com/dehydr8/cproxy/internal/proxy"
 )
 
 // DefaultPort is the shared local port the claude wrapper and its serve
@@ -21,6 +30,7 @@ const DefaultPort = 7788
 type ServeOptions struct {
 	Port    int      // shared port; DefaultPort when 0
 	Environ []string // inherited by the spawned serve instance
+	Token   string   // client token claude will present; verified before use
 }
 
 // EnsureServe makes sure a cproxy serve instance is listening on
@@ -33,6 +43,11 @@ type ServeOptions struct {
 // reach it without any service, profile, or login-shell wiring. It keeps
 // serving after claude exits; if it dies (machine reboot, orb update), the
 // next shim launch starts a fresh one.
+//
+// Before returning, the listener is verified (see Verify) to be a cproxy
+// that holds opts.Token, so the token is never handed to whatever else
+// happens to own the port, and a serve started with an older configuration
+// is reported instead of failing every request with 401.
 //
 // In an Amp orb (AMP_THREAD_ID set and the amp CLI on PATH) the usage
 // dashboard is also exposed as a portal, best-effort.
@@ -55,6 +70,9 @@ func EnsureServe(opts ServeOptions) (*exec.Cmd, error) {
 		if err := waitListening(spawned, addr, 10*time.Second); err != nil {
 			return spawned, fmt.Errorf("cproxy serve did not come up on %s (log: %s): %w", addr, ServeLogPath(), err)
 		}
+	}
+	if err := Verify(addr, opts.Token); err != nil {
+		return spawned, err
 	}
 	exposeUsagePortal(addr)
 	return spawned, nil
@@ -131,4 +149,41 @@ func exposeUsagePortal(addr string) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, amp, "orb", "portal", "http://"+addr+"/usage", "--title", "cproxy usage")
 	_ = cmd.Run()
+}
+
+// Verify checks that the listener on addr is a cproxy holding token, without
+// sending the token itself (see proxy.WhoamiPath). Its errors say what is
+// wrong and how to fix it: something that is not cproxy owns the port, an
+// older cproxy is still serving, or a cproxy started with a different
+// configuration does not know this token.
+func Verify(addr, token string) error {
+	nb := make([]byte, 16)
+	if _, err := rand.Read(nb); err != nil {
+		return err
+	}
+	nonce := hex.EncodeToString(nb)
+	q := url.Values{"client": {proxy.TokenHash(token)}, "nonce": {nonce}}
+	u := "http://" + addr + proxy.WhoamiPath + "?" + q.Encode()
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Get(u)
+	if err != nil {
+		return fmt.Errorf("could not check the listener on %s: %w", addr, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+
+	var who proxy.WhoamiResponse
+	if resp.StatusCode != http.StatusOK || json.Unmarshal(body, &who) != nil || who.Cproxy == "" {
+		if strings.Contains(string(body), `"cproxy: `) {
+			// Pre-whoami cproxy builds answer with their own auth error.
+			return fmt.Errorf("an older cproxy serve is running on %s; stop it (e.g. pkill -f 'cproxy serve') and the next launch starts a current one", addr)
+		}
+		return fmt.Errorf("something other than cproxy is listening on %s; cproxy will not send your client token to it. Free the port or pick another with %s / --port", addr, config.EnvPortName)
+	}
+	if !hmac.Equal([]byte(who.Proof), []byte(proxy.WhoamiProof(token, nonce))) {
+		return fmt.Errorf("the cproxy serve on %s (pid %d, %s) does not know this client token: it was started with a different configuration, and environment variables are only read when it starts. "+
+			"Restart it with `kill %d` (the next launch starts a fresh one), or use another %s", addr, who.PID, who.Cproxy, who.PID, config.EnvPortName)
+	}
+	return nil
 }
