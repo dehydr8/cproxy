@@ -4,13 +4,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -24,15 +22,6 @@ import (
 // EnsureServe: with CPROXY_WRAP_TEST_SERVE=1 it just listens on
 // CPROXY_WRAP_TEST_PORT forever, which is all EnsureServe needs to observe.
 func TestMain(m *testing.M) {
-	if os.Getenv("CPROXY_WRAP_TEST_SERVE") == "1" {
-		addr := net.JoinHostPort("127.0.0.1", os.Getenv("CPROXY_WRAP_TEST_PORT"))
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			os.Exit(1)
-		}
-		http.Serve(ln, cproxyKnowing(os.Getenv("CPROXY_WRAP_TEST_TOKEN")))
-		os.Exit(0)
-	}
 	// No ambient configuration in tests: the developer's own pool tokens
 	// must never reach a test or its output.
 	for _, kv := range os.Environ() {
@@ -52,52 +41,7 @@ func cproxyKnowing(token string) http.Handler {
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
 }
 
-func TestEnsureServeAlreadyListening(t *testing.T) {
-	t.Setenv("AMP_THREAD_ID", "") // never register Amp portals from tests
-	ts := httptest.NewServer(cproxyKnowing("cp_mine"))
-	defer ts.Close()
-	port := ts.Listener.Addr().(*net.TCPAddr).Port
-
-	cmd, err := EnsureServe(ServeOptions{Port: port, Token: "cp_mine"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cmd != nil {
-		t.Fatal("spawned a serve although one was already listening")
-	}
-}
-
-func TestEnsureServeSpawns(t *testing.T) {
-	t.Setenv("AMP_THREAD_ID", "")
-	t.Setenv(config.EnvHome, t.TempDir())
-
-	// Pick a free port, then give it up for the spawned serve to take.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	ln.Close()
-
-	environ := append(os.Environ(),
-		"CPROXY_WRAP_TEST_SERVE=1",
-		"CPROXY_WRAP_TEST_PORT="+strconv.Itoa(port),
-		"CPROXY_WRAP_TEST_TOKEN=cp_mine")
-	cmd, err := EnsureServe(ServeOptions{Port: port, Environ: environ, Token: "cp_mine"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cmd == nil || cmd.Process == nil {
-		t.Fatal("no serve process spawned")
-	}
-	defer cmd.Process.Kill()
-
-	if !listening(net.JoinHostPort("127.0.0.1", strconv.Itoa(port))) {
-		t.Fatal("spawned serve is not listening")
-	}
-}
-
-func TestEnsureServeWaitsForReload(t *testing.T) {
+func TestVerifyWaitsForReload(t *testing.T) {
 	t.Setenv("AMP_THREAD_ID", "")
 	// A running serve learns a just-created local token on its next reload.
 	var h atomic.Value
@@ -108,13 +52,12 @@ func TestEnsureServeWaitsForReload(t *testing.T) {
 	defer ts.Close()
 	time.AfterFunc(500*time.Millisecond, func() { h.Store(cproxyKnowing("cp_new")) })
 
-	port := ts.Listener.Addr().(*net.TCPAddr).Port
-	if _, err := EnsureServe(ServeOptions{Port: port, Token: "cp_new"}); err != nil {
-		t.Fatalf("EnsureServe did not wait for the reload: %v", err)
+	if err := VerifyWithGrace(ts.Listener.Addr().String(), "cp_new"); err != nil {
+		t.Fatalf("VerifyWithGrace did not wait for the reload: %v", err)
 	}
 }
 
-func TestEnsureServeRefusesWrongListener(t *testing.T) {
+func TestVerifyRefusesWrongListener(t *testing.T) {
 	t.Setenv("AMP_THREAD_ID", "")
 	old := verifyGrace
 	verifyGrace = 0
@@ -144,13 +87,9 @@ func TestEnsureServeRefusesWrongListener(t *testing.T) {
 		{"pre-whoami cproxy", older, "older cproxy serve"},
 		{"different config", stale, fmt.Sprintf("kill %d", os.Getpid())},
 	} {
-		port := tc.ts.Listener.Addr().(*net.TCPAddr).Port
-		cmd, err := EnsureServe(ServeOptions{Port: port, Token: token})
+		err := VerifyWithGrace(tc.ts.Listener.Addr().String(), token)
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Fatalf("%s: err = %v; want it to mention %q", tc.name, err, tc.want)
-		}
-		if cmd != nil {
-			t.Fatalf("%s: spawned a serve over a live listener", tc.name)
 		}
 	}
 	for _, s := range seen {
@@ -160,7 +99,7 @@ func TestEnsureServeRefusesWrongListener(t *testing.T) {
 	}
 }
 
-func TestEnsureServeRegistersOrbPortal(t *testing.T) {
+func TestExposeUsagePortal(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv(config.EnvHome, home)
 	t.Setenv("AMP_THREAD_ID", "T-test")
@@ -174,12 +113,8 @@ func TestEnsureServeRegistersOrbPortal(t *testing.T) {
 	}
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	ts := httptest.NewServer(cproxyKnowing("cp_mine"))
-	defer ts.Close()
-	port := ts.Listener.Addr().(*net.TCPAddr).Port
-	if _, err := EnsureServe(ServeOptions{Port: port, Token: "cp_mine", DashboardToken: "cp_dash"}); err != nil {
-		t.Fatal(err)
-	}
+	port := 7788
+	ExposeUsagePortal(fmt.Sprintf("127.0.0.1:%d", port), "cp_dash")
 	b, err := os.ReadFile(record)
 	if err != nil {
 		t.Fatalf("amp orb portal was not called: %v", err)

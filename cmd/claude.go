@@ -23,20 +23,21 @@ var (
 
 var claudeCmd = &cobra.Command{
 	Use:   "claude [flags] [--] [claude args…]",
-	Short: "Run the real claude through the shared local cproxy",
+	Short: "Run the real claude through the local cproxy daemon",
 	Long: `Run the real claude binary with ANTHROPIC_BASE_URL and
-ANTHROPIC_AUTH_TOKEN pointed at a shared local cproxy serve instance
-(127.0.0.1:7788 by default; $CPROXY_PORT or --port), starting one when
-nothing is listening. This is what the shim installed by ` + "`cproxy install`" + `
-runs; it also works on its own.
+ANTHROPIC_AUTH_TOKEN pointed at the per-user cproxy daemon, starting it when
+none runs and handing it this launch's CPROXY_* configuration (see
+` + "`cproxy daemon`" + `). This is what the shim installed by ` + "`cproxy install`" + ` runs;
+it also works on its own.
 
 Credentials come from the usual places (environment or
 ~/.cproxy/credentials.json). The client token claude presents is picked
 from the configured client tokens: $CPROXY_AUTH_TOKEN, then a matching
 $ANTHROPIC_AUTH_TOKEN, then the first proxy-scoped token in
-$CPROXY_CLIENT_TOKENS, then credentials.json. With pool accounts but no
-client token, cproxy creates a private local one (~/.cproxy/local-token)
-shared with the serve instance, so CPROXY_TOKENS alone is enough.
+$CPROXY_CLIENT_TOKEN_* / $CPROXY_CLIENT_TOKENS, then credentials.json. With
+pool accounts but no client token, cproxy creates a private local one
+(~/.cproxy/local-token) shared with the daemon, so CPROXY_TOKEN_* alone is
+enough.
 
 It backs off — running claude completely untouched — when nothing is
 configured, or when the environment already carries its own Anthropic
@@ -56,13 +57,13 @@ func init() {
 	claudeCmd.Flags().StringVar(&claudeExec, "exec", "",
 		"path to the real claude binary (default: resolve from PATH, unwrapping the shim)")
 	claudeCmd.Flags().IntVar(&claudePort, "port", defaultPort(),
-		"port of the shared serve instance (default $CPROXY_PORT or 7788)")
+		"port the daemon should prefer when it starts (default $CPROXY_PORT or 7788)")
 	// Flags after the first positional argument belong to claude, but an
 	// explicit "--" is always honored.
 	claudeCmd.Flags().SetInterspersed(false)
 }
 
-// defaultPort resolves the shared serve port from $CPROXY_PORT.
+// defaultPort resolves the daemon's preferred port from $CPROXY_PORT.
 func defaultPort() int {
 	if p := config.EnvPort(os.Environ()); p != "" {
 		if n, err := strconv.Atoi(p); err == nil && n > 0 && n < 65536 {
@@ -119,24 +120,34 @@ func runClaude(cmd *cobra.Command, args []string) error {
 	}
 
 	// In an orb the dashboard becomes a portal; give its URL a token that
-	// can only view usage. Created before the serve starts so it knows it.
+	// can only view usage. Created before the daemon starts so it knows it.
 	dashboard := ""
 	if wrap.InAmpOrb() {
 		if dashboard, err = config.EnsureDashboardToken(); err != nil {
 			return fmt.Errorf("create the dashboard token: %w", err)
 		}
 	}
-	if _, err := wrap.EnsureServe(wrap.ServeOptions{Port: claudePort, Environ: os.Environ(), Token: token, DashboardToken: dashboard}); err != nil {
+	// The per-user daemon serves every claude on this machine; start it or
+	// bring its configuration up to date, then make sure it knows our token.
+	environ := os.Environ()
+	if cmd.Flags().Changed("port") {
+		environ = append(environ, fmt.Sprintf("%s=%d", config.EnvPortName, claudePort))
+	}
+	_, st, err := wrap.EnsureDaemon(environ)
+	if err != nil {
 		return err
 	}
+	if err := wrap.VerifyWithGrace(st.Addr, token); err != nil {
+		return err
+	}
+	wrap.ExposeUsagePortal(st.Addr, dashboard)
 
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", claudePort)
-	log := newLogger()
-	log.Info("cproxy claude",
+	baseURL := "http://" + st.Addr
+	fileLogger("run.log").Info("cproxy claude",
 		"version", version.String(),
 		"proxy", baseURL,
-		"command", fmt.Sprintf("%q", argv[0]),
-		"port", claudePort)
+		"daemon", st.Version,
+		"command", fmt.Sprintf("%q", argv[0]))
 
 	env := launch.BuildChildEnv(os.Environ(), baseURL, token)
 	code, err := launch.Run(argv, env)

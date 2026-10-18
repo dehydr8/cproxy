@@ -3,9 +3,11 @@ package cmd
 
 import (
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
@@ -33,13 +35,14 @@ grouped into "pools") or in the environment:
 Quick start:
 
 	cproxy accounts add work --pool cvp
-	cproxy run --pool cvp -- claude       # local: Claude talks to cproxy
-	cproxy serve --addr :7788            # shared: others point at you
-	cproxy install                       # or: make the claude command itself go through it
+	cproxy run --pool cvp                 # local: claude through the per-user daemon
+	cproxy install                        # or: make the claude command itself go through it
+	cproxy usage                          # how the pool is doing (or: cproxy dashboard)
+	cproxy serve --addr :7788             # shared: others point at you
 
-By default each client sticks to one pool account and only switches when
-that account hits its limit, so a conversation pays for its full context on
-exactly one subscription instead of on every member of the pool.`,
+By default each client sticks to one pool account and moves on just before
+that account runs out (CPROXY_SWITCH_AT, default 90%), so a conversation
+pays for its full context on exactly one subscription at a time.`,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 }
@@ -47,7 +50,7 @@ exactly one subscription instead of on every member of the pool.`,
 func init() {
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false,
 		"suppress per-request logs (errors still print)")
-	rootCmd.AddCommand(runCmd, serveCmd, claudeCmd, installCmd, uninstallCmd,
+	rootCmd.AddCommand(runCmd, serveCmd, daemonCmd, dashboardCmd, claudeCmd, installCmd, uninstallCmd,
 		usageCmd, accountsCmd, poolsCmd, tokenCmd, setupTokenCmd, versionCmd)
 }
 
@@ -67,6 +70,22 @@ func newLogger() *slog.Logger {
 		level = slog.LevelWarn
 	}
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+}
+
+// fileLogger logs to a file under ~/.cproxy. Commands that share the
+// terminal with claude (run, the claude wrapper) must never write to it once
+// claude is drawing its interface there.
+func fileLogger(name string) *slog.Logger {
+	level := slog.LevelInfo
+	if quiet {
+		level = slog.LevelWarn
+	}
+	if err := os.MkdirAll(config.Home(), 0o700); err == nil {
+		if f, err := os.OpenFile(filepath.Join(config.Home(), name), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+			return slog.New(slog.NewTextHandler(f, &slog.HandlerOptions{Level: level}))
+		}
+	}
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // resolveUpstream picks the upstream base URL from a flag, else

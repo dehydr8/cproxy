@@ -75,8 +75,9 @@ func TestRunUsageCmd(t *testing.T) {
 	if gotPath != "/usage?format=json" {
 		t.Fatalf("requested %q", gotPath)
 	}
-	for _, want := range []string{"main", "142", "cooling", "amp", "req 38/50",
-		"5h 42.5%", "7d 12%", "spend USD 25.5/500", "Fable 20%",
+	for _, want := range []string{"main", "142 requests", "cooling", "amp",
+		"5-hour", "42.5%", "7-day", "12%", "Fable", "20%", "Extra usage", "USD 25.50 / 500.00",
+		"█", "░", // bar meters
 		"usage API: 403 (token needs the user:profile scope)"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
