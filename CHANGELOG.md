@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0](https://github.com/dehydr8/cproxy/compare/v1.0.0...v1.1.0) (2026-10-18)
+
+
+### Features
+
+* per-account env vars, CPROXY_POOL, account emails, new dashboard ([#5](https://github.com/dehydr8/cproxy/issues/5)) ([06f9313](https://github.com/dehydr8/cproxy/commit/06f93133da67b9bf3666c4fcc4dcd45c48a47d43))
+* wrapper creates its own local client token ([#3](https://github.com/dehydr8/cproxy/issues/3)) ([d7bb2f0](https://github.com/dehydr8/cproxy/commit/d7bb2f0636c4d4e4ceb5b0fb39cc9085b752e087))
+
 ## 1.0.0 (2026-10-18)
 
 
