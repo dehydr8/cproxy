@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -31,6 +32,10 @@ type Options struct {
 	MaxBody   int64             // max replayable request body; default 32 MiB
 	Log       *slog.Logger      // default slog.Default()
 	Transport http.RoundTripper // override for tests
+
+	// HideUsage keeps the dashboard (/usage) and /_cproxy/* off this
+	// handler; serve them on a private listener with UsageHandler instead.
+	HideUsage bool
 }
 
 // State is the request-time configuration. Serve mode swaps it atomically
@@ -56,13 +61,14 @@ var hopHeaders = []string{
 
 // Server is the cproxy HTTP handler.
 type Server struct {
-	upstream *url.URL
-	state    atomic.Pointer[State]
-	sel      *pool.Selector
-	client   *http.Client
-	log      *slog.Logger
-	maxBody  int64
-	started  time.Time // for the usage dashboard's uptime
+	upstream  *url.URL
+	state     atomic.Pointer[State]
+	sel       *pool.Selector
+	client    *http.Client
+	log       *slog.Logger
+	maxBody   int64
+	started   time.Time // for the usage dashboard's uptime
+	hideUsage bool
 
 	usage       *usagePoller // real usage API cache (preferred usage source)
 	usageStop   chan struct{}
@@ -89,7 +95,10 @@ func New(opts Options) *Server {
 	tr := opts.Transport
 	if tr == nil {
 		tr = &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
+			Proxy: http.ProxyFromEnvironment,
+			// Without a dial timeout an unreachable upstream holds the request
+			// for the OS connect timeout (minutes) instead of failing over.
+			DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          100,
 			MaxIdleConnsPerHost:   32,
@@ -99,12 +108,13 @@ func New(opts Options) *Server {
 		}
 	}
 	s := &Server{
-		upstream: opts.Upstream,
-		sel:      opts.Selector,
-		client:   &http.Client{Transport: tr},
-		log:      opts.Log,
-		maxBody:  opts.MaxBody,
-		started:  time.Now(),
+		upstream:  opts.Upstream,
+		sel:       opts.Selector,
+		client:    &http.Client{Transport: tr},
+		log:       opts.Log,
+		maxBody:   opts.MaxBody,
+		started:   time.Now(),
+		hideUsage: opts.HideUsage,
 		usage: &usagePoller{
 			entries: map[string]*usageEntry{},
 		},
@@ -166,9 +176,32 @@ func clientToken(r *http.Request) string {
 	return strings.TrimSpace(r.Header.Get("X-Api-Key"))
 }
 
+// ServeHTTP serves the proxy API and, unless HideUsage is set, the usage
+// dashboard.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.serve(w, r, !s.hideUsage, true)
+}
+
+// UsageHandler serves only the usage dashboard and /_cproxy/*, for a private
+// listener (serve --usage-addr) next to a public API-only one.
+func (s *Server) UsageHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.serve(w, r, true, false)
+	})
+}
+
+func isUsagePath(p string) bool { return p == "/usage" || strings.HasPrefix(p, "/_cproxy/") }
+
+func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) {
 	start := time.Now()
 	st := s.state.Load()
+
+	// Paths this listener does not serve are 404 before authentication,
+	// so a public API-only listener does not reveal the dashboard exists.
+	if isUsagePath(r.URL.Path) && !usage || !isUsagePath(r.URL.Path) && !api {
+		writeError(w, http.StatusNotFound, "not_found_error", "cproxy: not found")
+		return
+	}
 
 	if r.URL.Path == WhoamiPath && r.Method == http.MethodGet {
 		s.serveWhoami(w, r, st) // unauthenticated by design; see WhoamiPath

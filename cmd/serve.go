@@ -30,6 +30,7 @@ var (
 	serveTLSCert      string
 	serveTLSKey       string
 	serveNoAuth       bool
+	serveUsageAddr    string
 )
 
 var serveCmd = &cobra.Command{
@@ -67,6 +68,8 @@ func init() {
 		"serve-mode client tokens as name:token,name:token (overrides same-named file/env entries)")
 	serveCmd.Flags().StringVar(&serveTLSCert, "tls-cert", "", "TLS certificate file (optional)")
 	serveCmd.Flags().StringVar(&serveTLSKey, "tls-key", "", "TLS private key file (optional)")
+	serveCmd.Flags().StringVar(&serveUsageAddr, "usage-addr", "",
+		"serve the /usage dashboard on this separate address only (e.g. a private network), keeping it off --addr")
 	serveCmd.Flags().BoolVar(&serveNoAuth, "no-auth", false,
 		"accept unauthenticated clients (dangerous; localhost only)")
 }
@@ -90,9 +93,22 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 
-	srv := proxy.New(proxy.Options{Upstream: upstream, State: st, Log: newLogger()})
+	srv := proxy.New(proxy.Options{Upstream: upstream, State: st, Log: newLogger(), HideUsage: serveUsageAddr != ""})
 	httpSrv := &http.Server{Handler: srv, ReadHeaderTimeout: 30 * time.Second}
 	log := newLogger()
+
+	// --usage-addr: the dashboard gets its own (private) listener and the
+	// public one serves only the API.
+	var usageSrv *http.Server
+	if serveUsageAddr != "" {
+		uln, err := net.Listen("tcp", serveUsageAddr)
+		if err != nil {
+			return fmt.Errorf("listen on --usage-addr: %w", err)
+		}
+		usageSrv = &http.Server{Handler: srv.UsageHandler(), ReadHeaderTimeout: 30 * time.Second}
+		go usageSrv.Serve(uln)
+		log.Info("usage dashboard on its own listener", "listen", "http://"+uln.Addr().String()+"/usage")
+	}
 
 	scheme := "http"
 	if serveTLSCert != "" || serveTLSKey != "" {
@@ -134,6 +150,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		httpSrv.Shutdown(ctx)
+		if usageSrv != nil {
+			usageSrv.Shutdown(ctx)
+		}
 		srv.Close()
 	}()
 

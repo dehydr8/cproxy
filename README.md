@@ -52,6 +52,16 @@ or build from a checkout:
 go build -o /usr/local/bin/cproxy .
 ```
 
+## Two ways to run it
+
+- **Local**: the pool tokens live on the machine running Claude. `cproxy run
+  -- claude` proxies one launch; `cproxy install` routes every `claude`
+  launch through a shared local serve (see below, and
+  [Using it inside Amp](#using-it-inside-amp)).
+- **Remote**: one `cproxy serve` holds the pool tokens and several people or
+  machines use it. Clients only need its URL and a client token; see
+  [Hosting a shared cproxy](#hosting-a-shared-cproxy).
+
 ## Quick start
 
 ```sh
@@ -224,6 +234,68 @@ Scopes limit what a client token may do:
 A token with no scopes may do both; `{"token": "cp_…", "scopes": ["usage"]}`
 (or `CPROXY_CLIENT_TOKENS=monitor:cp_…:usage`) is a dashboard-only token for
 someone who should see pool health but never spend it.
+
+## Hosting a shared cproxy
+
+Run one `cproxy serve` that holds the pool, and hand each person (or
+machine) a client token. The pool tokens never leave the server.
+
+### On the client
+
+There is nothing to install. Point Claude Code at the server:
+
+```sh
+export ANTHROPIC_BASE_URL=https://my-cproxy.fly.dev
+export ANTHROPIC_AUTH_TOKEN=cp_…     # the client token you were given
+claude
+```
+
+If the cproxy shim is installed on that machine it sees `ANTHROPIC_BASE_URL`
+and stays out of the way. In Amp, set those two variables (the token as a
+secret) in your personal or project env instead of `CPROXY_TOKEN_*`.
+
+### On the server
+
+Generate one client token per person with `cproxy token`, then start serve
+with the pool and client tokens in its environment:
+
+```sh
+CPROXY_TOKEN_MAIN=sk-ant-oat01-… CPROXY_TOKEN_ALT=sk-ant-oat01-… \
+CPROXY_CLIENT_TOKENS=alice:cp_…,bob:cp_…,monitor:cp_…:usage \
+  cproxy serve --addr :7788 --usage-addr 127.0.0.1:7789
+```
+
+`--usage-addr` moves the dashboard to its own listener: the public `--addr`
+serves only the API (and answers 404 for `/usage`), so bind the usage
+address to loopback or a private network. Terminate TLS in front of
+`--addr` (or use `--tls-cert/--tls-key`).
+
+### Fly.io
+
+[`deploy/fly`](deploy/fly) is a ready template: a small distroless image
+built from this repository, the API on `https://<app>.fly.dev`, and the
+dashboard on the app's private network only. From the repository root:
+
+```sh
+fly apps create my-cproxy             # then set `app` in deploy/fly/fly.toml
+fly secrets set -a my-cproxy \
+  CPROXY_TOKEN_MAIN=sk-ant-oat01-… CPROXY_TOKEN_ALT=sk-ant-oat01-… \
+  CPROXY_CLIENT_TOKENS=alice:cp_…,bob:cp_…,monitor:cp_…:usage
+fly deploy -c deploy/fly/fly.toml --ha=false
+```
+
+To look at the dashboard, open a private tunnel and use a usage-scoped
+token:
+
+```sh
+fly proxy 7789 -a my-cproxy
+open "http://localhost:7789/usage?token=cp_…"            # browser
+CPROXY_CLIENT_TOKENS=monitor:cp_…:usage cproxy usage --port 7789   # terminal
+```
+
+Keep it to **one machine** (`--ha=false`, no autostop): sticky pins,
+cooldowns and usage caches live in memory, so a second machine would split
+them, and a restart (deploy, `fly secrets set`) starts them fresh.
 
 ## Usage dashboard
 
