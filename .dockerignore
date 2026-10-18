@@ -1,0 +1,4 @@
+.git
+.amp
+*.md
+!README.md

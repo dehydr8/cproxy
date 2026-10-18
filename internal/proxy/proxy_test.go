@@ -685,3 +685,42 @@ func TestUsageJSONAndRateLimits(t *testing.T) {
 		}
 	}
 }
+
+func TestHideUsageSplitsListeners(t *testing.T) {
+	up := newFakeUpstream(t, func(w http.ResponseWriter, h hit) { w.WriteHeader(200) })
+	u, _ := url.Parse(up.URL)
+	accts := []pool.Account{{Name: "a", Token: "tokA"}}
+	clients := map[string]config.ClientAuth{"cp_alice": {Name: "alice"}}
+	srv := New(Options{Upstream: u, State: &State{Runtime: testRuntime(accts, clients)},
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), HideUsage: true})
+	t.Cleanup(srv.Close)
+	public := httptest.NewServer(srv)
+	t.Cleanup(public.Close)
+	private := httptest.NewServer(srv.UsageHandler())
+	t.Cleanup(private.Close)
+
+	// Public: the API works; the dashboard and /_cproxy/* do not exist,
+	// even for a valid token.
+	if resp := doReq(t, "POST", public.URL+"/v1/messages", aliceHeaders(), "{}"); resp.StatusCode != 200 {
+		t.Fatalf("public API: %d", resp.StatusCode)
+	}
+	for _, p := range []string{"/usage", "/usage?format=json", WhoamiPath} {
+		if resp := doReq(t, "GET", public.URL+p, aliceHeaders(), ""); resp.StatusCode != 404 {
+			t.Fatalf("public %s: %d, want 404", p, resp.StatusCode)
+		}
+	}
+
+	// Private: the dashboard (still authenticated) and nothing else.
+	if resp := doReq(t, "GET", private.URL+"/usage?format=json", aliceHeaders(), ""); resp.StatusCode != 200 {
+		t.Fatalf("private usage: %d", resp.StatusCode)
+	}
+	if resp := doReq(t, "GET", private.URL+"/usage", nil, ""); resp.StatusCode != 401 {
+		t.Fatalf("private usage without a token: %d, want 401", resp.StatusCode)
+	}
+	if resp := doReq(t, "POST", private.URL+"/v1/messages", aliceHeaders(), "{}"); resp.StatusCode != 404 {
+		t.Fatalf("private API: %d, want 404", resp.StatusCode)
+	}
+	if got := len(up.recorded()); got != 1 {
+		t.Fatalf("upstream saw %d requests; want only the public API call", got)
+	}
+}

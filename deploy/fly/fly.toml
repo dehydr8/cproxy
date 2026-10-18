@@ -1,0 +1,44 @@
+# Fly.io template for a shared cproxy. From the repository root:
+#
+#   fly apps create my-cproxy            # then set `app` below
+#   fly secrets set CPROXY_TOKEN_MAIN=sk-ant-oat01-… CPROXY_CLIENT_TOKENS=alice:cp_…,bob:cp_…
+#   fly deploy -c deploy/fly/fly.toml --ha=false
+#
+# Only the API is public (https://<app>.fly.dev). The usage dashboard
+# listens on the app's private network address; reach it with
+# `fly proxy 7789 -a <app>`. See "Hosting a shared cproxy" in README.md.
+
+app = "my-cproxy"
+primary_region = "yyz"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[processes]
+  app = "serve --addr :7788 --usage-addr fly-local-6pn:7789"
+
+[http_service]
+  processes = ["app"]
+  internal_port = 7788
+  force_https = true
+  # Sticky pins and cooldowns live in memory: keep exactly one machine up.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 200
+    hard_limit = 250
+
+[checks]
+  [checks.alive]
+    type = "tcp"
+    port = 7788
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
