@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.0](https://github.com/dehydr8/cproxy/compare/v1.4.0...v1.5.0) (2026-10-18)
+
+
+### Features
+
+* move sticky clients before their account runs out ([#14](https://github.com/dehydr8/cproxy/issues/14)) ([e3f1f08](https://github.com/dehydr8/cproxy/commit/e3f1f08afe6ad1998eb514136bc5e678d84213ae))
+
 ## [1.4.0](https://github.com/dehydr8/cproxy/compare/v1.3.0...v1.4.0) (2026-10-18)
 
 
