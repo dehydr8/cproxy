@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.0](https://github.com/dehydr8/cproxy/compare/v1.2.0...v1.3.0) (2026-10-18)
+
+
+### Features
+
+* the orb dashboard portal opens without asking for a token ([#9](https://github.com/dehydr8/cproxy/issues/9)) ([0b1fbc8](https://github.com/dehydr8/cproxy/commit/0b1fbc88c5b607d9bb77231c6c6b04677ffe39d4))
+
+
+### Bug Fixes
+
+* steady dashboard refresh, no scrollbars ([#11](https://github.com/dehydr8/cproxy/issues/11)) ([dd91c34](https://github.com/dehydr8/cproxy/commit/dd91c34061e6e574d2476a3f253a3c6ca7efc8ad))
+
 ## [1.2.0](https://github.com/dehydr8/cproxy/compare/v1.1.0...v1.2.0) (2026-10-18)
 
 
