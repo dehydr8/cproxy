@@ -166,13 +166,6 @@ func clientToken(r *http.Request) string {
 	return strings.TrimSpace(r.Header.Get("X-Api-Key"))
 }
 
-func poolNameFor(ca config.ClientAuth) string {
-	if ca.Pool != "" {
-		return ca.Pool
-	}
-	return config.DefaultPoolName
-}
-
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	st := s.state.Load()
@@ -220,7 +213,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pn := poolNameFor(ca)
+	pn := st.Runtime.PoolFor(ca)
 	// Read the pin before Ranked, which remaps a client whose pinned account
 	// became unavailable.
 	prev := s.sel.Assignment(pn, ca.Name)

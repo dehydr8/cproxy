@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/dehydr8/cproxy/internal/pool"
@@ -56,49 +57,109 @@ func parseTokenList(list, genPrefix string) []envToken {
 	return out
 }
 
-// envAccounts collects pool members from CPROXY_TOKENS and
-// CPROXY_POOL_TOKENS_<NAME> variables.
-func envAccounts(environ []string) []pool.Account {
-	var out []pool.Account
-	add := func(list, poolName string) {
-		for _, e := range parseTokenList(list, "env") {
-			out = append(out, pool.Account{
-				Name:   e.Name,
-				Token:  e.Token,
-				Type:   pool.DetectTokenType(e.Token),
-				Pools:  []string{poolName},
-				Source: "env",
-			})
+// envAccounts collects pool members from the environment:
+//
+//	CPROXY_TOKENS=name:tok,…            list → default pool
+//	CPROXY_POOL_TOKENS_<POOL>=name:tok,… list → POOL
+//	CPROXY_TOKEN_<NAME>=tok              one account → default pool
+//	CPROXY_POOL_TOKEN_<POOL>_<NAME>=tok  one account "<pool>-<name>" → POOL
+//
+// Names are lowercased. In the per-account form the pool is the first
+// segment after the prefix, so pool names cannot contain "_"; the account
+// name is prefixed with the pool because account names are global (health
+// state is keyed by them). A name that repeats keeps its last definition,
+// and a token that repeats under several names becomes one account in all
+// of their pools, named by the plainest form, so one subscription is never
+// tracked as two.
+func envAccounts(environ []string) ([]pool.Account, error) {
+	vars := map[string]string{}
+	for _, kv := range environ {
+		if k, v, ok := strings.Cut(kv, "="); ok && v != "" {
+			vars[k] = v
 		}
 	}
-	for _, kv := range environ {
-		k, v, ok := strings.Cut(kv, "=")
-		if !ok || v == "" {
-			continue
-		}
+	// Read by form, then by name: when one token appears under several
+	// names, the plainest name (CPROXY_TOKENS, then CPROXY_TOKEN_*) wins.
+	form := func(k string) int {
 		switch {
 		case k == EnvTokens:
-			add(v, DefaultPoolName)
-		case len(k) > len(EnvPoolPrefix) && strings.HasPrefix(k, EnvPoolPrefix):
-			add(v, strings.ToLower(k[len(EnvPoolPrefix):]))
+			return 0
+		case strings.HasPrefix(k, EnvTokenPrefix):
+			return 1
+		case strings.HasPrefix(k, EnvPoolPrefix):
+			return 2
+		default:
+			return 3
 		}
 	}
-	// A name repeated across variables: the later variable wins.
+	keys := make([]string, 0, len(vars))
+	for k := range vars {
+		keys = append(keys, k)
+	}
+	slices.SortFunc(keys, func(a, b string) int {
+		if fa, fb := form(a), form(b); fa != fb {
+			return fa - fb
+		}
+		return strings.Compare(a, b)
+	})
+
+	var out []pool.Account
+	add := func(name, tok, poolName string) {
+		a := pool.Account{
+			Name:   name,
+			Token:  tok,
+			Type:   pool.DetectTokenType(tok),
+			Pools:  []string{poolName},
+			Source: "env",
+		}
+		if i := slices.IndexFunc(out, func(x pool.Account) bool { return x.Name == name }); i >= 0 {
+			out[i] = a
+			return
+		}
+		out = append(out, a)
+	}
+	for _, k := range keys {
+		v := vars[k]
+		switch {
+		case k == EnvTokens:
+			for _, e := range parseTokenList(v, "env") {
+				add(e.Name, e.Token, DefaultPoolName)
+			}
+		case strings.HasPrefix(k, EnvPoolPrefix) && len(k) > len(EnvPoolPrefix):
+			p := strings.ToLower(k[len(EnvPoolPrefix):])
+			for _, e := range parseTokenList(v, "env") {
+				add(e.Name, e.Token, p)
+			}
+		case strings.HasPrefix(k, EnvPoolTokenPref):
+			p, n, ok := strings.Cut(k[len(EnvPoolTokenPref):], "_")
+			if !ok || p == "" || n == "" {
+				return nil, fmt.Errorf("%s: want %s<POOL>_<NAME> (pool names cannot contain \"_\")", k, EnvPoolTokenPref)
+			}
+			p = strings.ToLower(p)
+			add(p+"-"+strings.ToLower(n), strings.TrimSpace(v), p)
+		case strings.HasPrefix(k, EnvTokenPrefix):
+			n := k[len(EnvTokenPrefix):]
+			if n == "" {
+				return nil, fmt.Errorf("%s: want %s<NAME>", k, EnvTokenPrefix)
+			}
+			add(strings.ToLower(n), strings.TrimSpace(v), DefaultPoolName)
+		}
+	}
+
+	// One token under several names: keep the first account, in every pool.
 	merged := out[:0]
 	for _, a := range out {
-		replaced := false
-		for i := range merged {
-			if merged[i].Name == a.Name {
-				merged[i] = a
-				replaced = true
-				break
+		if i := slices.IndexFunc(merged, func(x pool.Account) bool { return x.Token == a.Token }); i >= 0 {
+			for _, p := range a.Pools {
+				if !slices.Contains(merged[i].Pools, p) {
+					merged[i].Pools = append(merged[i].Pools, p)
+				}
 			}
+			continue
 		}
-		if !replaced {
-			merged = append(merged, a)
-		}
+		merged = append(merged, a)
 	}
-	return merged
+	return merged, nil
 }
 
 // envClientTokens parses CPROXY_CLIENT_TOKENS into named specs.
@@ -192,4 +253,14 @@ func ClientTokensFromList(list string) map[string]ClientTokenSpec {
 		specs[e.Name] = e.Spec
 	}
 	return specs
+}
+
+// EnvPool returns CPROXY_POOL from environ, or "".
+func EnvPool(environ []string) string {
+	for _, kv := range environ {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == EnvPoolName && v != "" {
+			return v
+		}
+	}
+	return ""
 }

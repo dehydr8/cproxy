@@ -177,8 +177,12 @@ func renderUsage(out io.Writer, snap proxy.UsageSnapshot, addr string, now time.
 	fmt.Fprintf(w, "\naccounts\t\n")
 	fmt.Fprintf(w, "  name\tstate\treq\t429\terr\tlast used\tusage\trate limits\n")
 	for _, a := range snap.Accounts {
+		name := a.Name
+		if a.Email != "" {
+			name += " (" + a.Email + ")"
+		}
 		fmt.Fprintf(w, "  %s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\n",
-			a.Name, accountState(a, now), a.Requests, a.RateLimited, a.Errors,
+			name, accountState(a, now), a.Requests, a.RateLimited, a.Errors,
 			agoString(a.LastUsed, now),
 			proxy.UsageAPISummary(a.UsageAPI, a.UsageAPIErr, now),
 			proxy.RateLimitsSummary(a.RateLimits, now))
@@ -221,19 +225,8 @@ func orDash(s string) string {
 	return s
 }
 
-// humanDur renders a duration compactly (38s, 4m0s, 2h0m0s).
-func humanDur(d time.Duration) string {
-	switch {
-	case d < 0:
-		return "0s"
-	case d < time.Minute:
-		return d.Round(time.Second).String()
-	case d < time.Hour:
-		return d.Round(time.Minute).String()
-	default:
-		return d.Round(time.Hour).String()
-	}
-}
+// humanDur renders a duration like the dashboard does (47m, 1h 32m).
+func humanDur(d time.Duration) string { return proxy.HumanDuration(d) }
 
 // envValue reads one variable from an environ-style slice.
 func envValue(environ []string, name string) string {

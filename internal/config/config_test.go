@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -140,7 +141,10 @@ func TestEnvAccounts(t *testing.T) {
 		"CPROXY_POOL_TOKENS_CVP=lead:sk-ant-oat01-1,alt:sk-ant-oat01-2",
 		"CPROXY_UPSTREAM=https://example.invalid",
 	}
-	got := envAccounts(environ)
+	got, err := envAccounts(environ)
+	if err != nil {
+		t.Fatal(err)
+	}
 	byName := map[string]pool.Account{}
 	for _, a := range got {
 		byName[a.Name] = a
@@ -156,6 +160,71 @@ func TestEnvAccounts(t *testing.T) {
 	}
 	if a := byName["alt"]; a.Pools[0] != "cvp" {
 		t.Fatalf("cvp member pools = %v", a.Pools)
+	}
+}
+
+func TestEnvPerAccountTokens(t *testing.T) {
+	environ := []string{
+		"CPROXY_TOKEN_ABC=sk-ant-oat01-abc",
+		"CPROXY_TOKEN_XYZ=sk-ant-api03-xyz",
+		"CPROXY_POOL_TOKEN_CVP_A=sk-ant-oat01-a",
+		"CPROXY_POOL_TOKEN_CVP_B=sk-ant-oat01-b",
+		// Same name in another pool must not collide with cvp's "a".
+		"CPROXY_POOL_TOKEN_OPS_A=sk-ant-oat01-opsa",
+		// The same subscription in two pools is one account in both.
+		"CPROXY_POOL_TOKEN_OPS_SHARED=sk-ant-oat01-abc",
+		"CPROXY_POOL=cvp",
+	}
+	got, err := envAccounts(environ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byName := map[string]pool.Account{}
+	for _, a := range got {
+		byName[a.Name] = a
+	}
+	want := map[string][]string{
+		"abc":   {DefaultPoolName, "ops"},
+		"xyz":   {DefaultPoolName},
+		"cvp-a": {"cvp"},
+		"cvp-b": {"cvp"},
+		"ops-a": {"ops"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("accounts = %+v; want exactly %v", got, want)
+	}
+	for name, pools := range want {
+		a, ok := byName[name]
+		if !ok || !slices.Equal(a.Pools, pools) {
+			t.Fatalf("account %q = %+v; want pools %v", name, a, pools)
+		}
+	}
+	if byName["xyz"].Type != pool.TokenTypeAPI || byName["cvp-a"].Token != "sk-ant-oat01-a" {
+		t.Fatalf("token/type mixed up: %+v", got)
+	}
+
+	// CPROXY_POOL picks the pool clients without their own use.
+	rt, err := Build(&FileConfig{}, environ)
+	if err != nil {
+		t.Fatal(err)
+	}
+	members, _, err := rt.ResolvePool("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, m := range members {
+		names = append(names, m.Name)
+	}
+	if !slices.Equal(names, []string{"cvp-a", "cvp-b"}) || rt.PoolFor(ClientAuth{Name: "x"}) != "cvp" {
+		t.Fatalf("CPROXY_POOL=cvp resolved to %v", names)
+	}
+	if rt.PoolFor(ClientAuth{Name: "x", Pool: "ops"}) != "ops" {
+		t.Fatal("a client's own pool must beat CPROXY_POOL")
+	}
+
+	if _, err := envAccounts([]string{"CPROXY_POOL_TOKEN_CVP=sk-ant-oat01-a"}); err == nil {
+		t.Fatal("CPROXY_POOL_TOKEN_<POOL> without an account name was accepted")
 	}
 }
 

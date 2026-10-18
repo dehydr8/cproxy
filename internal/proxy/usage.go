@@ -7,8 +7,11 @@
 package proxy
 
 import (
+	_ "embed"
 	"encoding/json"
+	"hash/fnv"
 	"html/template"
+	"math"
 	"net/http"
 	"slices"
 	"strconv"
@@ -22,115 +25,183 @@ import (
 
 type accountRow struct {
 	Name        string
+	Email       string // from the profile API when the token may read it
+	Org         string
+	Initials    string
+	Hue         int
 	Type        string
-	Pools       string
+	Pools       []string
 	Token       string // masked
 	Requests    int64
 	RateLimited int64
 	Rejected    int64
 	Errors      int64
-	State       string // ok / cooling … / invalid token / disabled
-	StateClass  string // CSS class for the state cell
-	UsageAPI    string // real usage API numbers, preferred over the headers
-	RateLimits  string // last anthropic-ratelimit-* headers, humanized
+	State       string // available / cooling 4m / invalid token / disabled
+	Tone        string // badge tone: ok, warn, danger or "" (neutral)
+	Meters      []meter
+	Spend       string
+	UsageNote   string // why there are no usage API numbers
+	HeaderNote  string // fallback: last anthropic-ratelimit-* headers
 	LastUsed    string
+	LastUsedAt  string // RFC3339, for the tooltip
+}
+
+// meter is one utilization bar (5h, 7d, a per-model limit).
+type meter struct {
+	Label string
+	Text  string // "42.5%"
+	Width string // CSS width, clamped to 0–100%
+	Tone  string // ok, warn, danger
+	Reset string // "resets in 1h30m"
 }
 
 type clientRow struct {
 	Name     string
+	Initials string
+	Hue      int
 	Pool     string
 	Pinned   string
 	Requests int64
 	LastSeen string
+	Active   bool // seen within the last two minutes
 }
 
 type usageData struct {
 	Version    string
 	Upstream   string
-	Accounts   []accountRow
-	Clients    []clientRow
 	Uptime     string
 	TokenParam string // set when the page was opened with ?token=…
+
+	Accounts []accountRow
+	Clients  []clientRow
+
+	Available, Cooling, Unusable  int
+	Requests, RateLimited, Errors int64
+	ActiveClients                 int
 }
+
+// usageCSS styles the dashboard; it is inlined so the page needs no other
+// request.
+//
+//go:embed usage.css
+var usageCSS string
 
 var usageTmpl = template.Must(template.New("usage").Parse(`
 {{define "stats"}}
-<div class="meta">
-  <b>{{.Version}}</b> &middot; upstream <b>{{.Upstream}}</b> &middot;
-  accounts <b>{{len .Accounts}}</b> &middot; clients <b>{{len .Clients}}</b> &middot;
-  up <b>{{.Uptime}}</b>
+<div class="tiles">
+  <div class="card tile"><div class="label">Accounts available</div>
+    <div class="value{{if and .Accounts (eq .Available 0)}} value-danger{{else if .Available}} value-ok{{end}}">{{.Available}}<span class="of">/{{len .Accounts}}</span></div>
+    <div class="hint">{{if .Cooling}}{{.Cooling}} cooling down{{else if .Unusable}}{{.Unusable}} unusable{{else}}none cooling down{{end}}</div></div>
+  <div class="card tile"><div class="label">Requests served</div>
+    <div class="value">{{.Requests}}</div><div class="hint">since start</div></div>
+  <div class="card tile"><div class="label">Rate limited</div>
+    <div class="value{{if .RateLimited}} value-warn{{end}}">{{.RateLimited}}</div><div class="hint">429s failed over</div></div>
+  <div class="card tile"><div class="label">Upstream errors</div>
+    <div class="value{{if .Errors}} value-warn{{end}}">{{.Errors}}</div><div class="hint">transport failures</div></div>
+  <div class="card tile"><div class="label">Clients</div>
+    <div class="value">{{.ActiveClients}}<span class="of">/{{len .Clients}}</span></div><div class="hint">active in the last 2m</div></div>
 </div>
-<table>
-  <thead><tr><th>account</th><th>type</th><th>pools</th><th>token</th>
-    <th>requests</th><th>429s</th><th>errors</th><th>rejected</th>
-    <th>state</th><th>usage</th><th>rate limits</th><th>last used</th></tr></thead>
-  <tbody>
-  {{range .Accounts}}
-    <tr><td>{{.Name}}</td><td>{{.Type}}</td><td>{{.Pools}}</td><td>{{.Token}}</td>
-      <td class="num">{{.Requests}}</td><td class="num">{{.RateLimited}}</td>
-      <td class="num">{{.Errors}}</td><td class="num">{{.Rejected}}</td>
-      <td class="{{.StateClass}}">{{.State}}</td><td class="ua">{{.UsageAPI}}</td>
-      <td class="rl">{{.RateLimits}}</td><td>{{.LastUsed}}</td></tr>
-  {{else}}
-    <tr><td colspan="12">no accounts configured</td></tr>
-  {{end}}
-  </tbody>
-</table>
-<table>
-  <thead><tr><th>client</th><th>pool</th><th>pinned account</th>
-    <th>requests</th><th>last seen</th></tr></thead>
-  <tbody>
-  {{range .Clients}}
-    <tr><td>{{.Name}}</td><td>{{.Pool}}</td><td>{{.Pinned}}</td>
-      <td class="num">{{.Requests}}</td><td>{{.LastSeen}}</td></tr>
-  {{else}}
-    <tr><td colspan="5">no clients yet</td></tr>
-  {{end}}
-  </tbody>
-</table>
+
+<section class="section">
+  <div class="table-toolbar"><h2>Accounts<span class="count">{{len .Accounts}}</span></h2></div>
+  <div class="table-wrap">
+  {{if .Accounts}}
+  <table>
+    <thead><tr><th scope="col">Account</th><th scope="col">State</th><th scope="col" class="fill">Usage</th>
+      <th scope="col" class="num">Requests</th><th scope="col" class="num">429s</th><th scope="col" class="num">Errors</th>
+      <th scope="col">Last used</th><th scope="col">Token</th></tr></thead>
+    <tbody>
+    {{range .Accounts}}
+    <tr data-account="{{.Name}}">
+      <td><span class="identity"><span class="avatar hue-{{.Hue}}" aria-hidden="true">{{.Initials}}</span>
+        <span class="identity-copy"><span class="identity-name">{{.Name}}{{range .Pools}} <span class="chip chip-tag">{{.}}</span>{{end}}</span>
+        <span class="identity-sub">{{if .Email}}{{.Email}}{{else}}{{.Type}} token{{end}}</span></span></span></td>
+      <td><span class="badge{{if .Tone}} {{.Tone}}{{end}}">{{.State}}</span></td>
+      <td class="fill usage">
+        {{if .Meters}}<div class="meters">{{range .Meters}}
+          <div class="meter"><div class="meter-top"><span>{{.Label}}</span><span class="meter-value {{.Tone}}">{{.Text}}</span></div>
+          <div class="meter-track"><div class="meter-fill {{.Tone}}" style="width: {{.Width}}"></div></div>
+          {{if .Reset}}<div class="meter-reset">{{.Reset}}</div>{{end}}</div>{{end}}
+        </div>{{end}}
+        {{if .Spend}}<div class="note">{{.Spend}}</div>{{end}}
+        {{if .UsageNote}}<div class="note">{{.UsageNote}}</div>{{end}}
+        {{if .HeaderNote}}<div class="note">from response headers: {{.HeaderNote}}</div>{{end}}
+        {{if not (or .Meters .Spend .UsageNote .HeaderNote)}}<span class="faint">no usage seen yet</span>{{end}}
+      </td>
+      <td class="num">{{.Requests}}</td>
+      <td class="num{{if .RateLimited}} warn-fg{{end}}">{{.RateLimited}}</td>
+      <td class="num{{if .Errors}} warn-fg{{end}}">{{.Errors}}</td>
+      <td class="nowrap"{{if .LastUsedAt}} title="{{.LastUsedAt}}"{{end}}>{{.LastUsed}}</td>
+      <td><code>{{.Token}}</code></td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}<p class="empty">No accounts configured. Add one with <code>cproxy accounts add NAME</code> or <code>CPROXY_TOKEN_NAME</code>.</p>{{end}}
+  </div>
+</section>
+
+<section class="section">
+  <div class="table-toolbar"><h2>Clients<span class="count">{{len .Clients}}</span></h2></div>
+  <div class="table-wrap">
+  {{if .Clients}}
+  <table>
+    <thead><tr><th scope="col" class="fill">Client</th><th scope="col">Pool</th><th scope="col">Pinned account</th>
+      <th scope="col" class="num">Requests</th><th scope="col">Last seen</th></tr></thead>
+    <tbody>
+    {{range .Clients}}
+    <tr data-client="{{.Name}}">
+      <td class="fill"><span class="identity identity-compact"><span class="avatar hue-{{.Hue}}" aria-hidden="true">{{.Initials}}</span><span class="identity-name truncate">{{.Name}}</span></span></td>
+      <td><span class="chip chip-tag">{{.Pool}}</span></td>
+      <td>{{if .Pinned}}<code>{{.Pinned}}</code>{{else}}<span class="faint">–</span>{{end}}</td>
+      <td class="num">{{.Requests}}</td>
+      <td>{{if .Active}}<span class="presence presence-on">active</span>{{else}}<span class="presence">{{.LastSeen}}</span>{{end}}</td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+  {{else}}<p class="empty">No clients yet.</p>{{end}}
+  </div>
+</section>
 {{end}}
 
-{{define "page"}}
-<!doctype html>
+{{define "page"}}<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>cproxy usage</title>
-<style>
-  :root { color-scheme: dark; }
-  body { font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-         background: #0e1116; color: #cfd8e3; margin: 2rem auto; max-width: 84rem; padding: 0 1rem; }
-  h1 { font-size: 1.15rem; letter-spacing: .12em; margin: 0; color: #e6edf3; }
-  h1 span { color: #7fb4e8; }
-  .meta { color: #8896a6; font-size: .8rem; margin: .5rem 0 1.75rem; }
-  .meta b { color: #cfd8e3; font-weight: 500; }
-  table { border-collapse: collapse; margin-bottom: 2rem; width: 100%; }
-  th, td { text-align: left; padding: .45rem .8rem; border-bottom: 1px solid #1f2630; white-space: nowrap; }
-  td.rl { white-space: normal; min-width: 15rem; max-width: 22rem; }
-  td.ua { white-space: normal; min-width: 12rem; max-width: 20rem; }
-  th { color: #8896a6; font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; font-weight: 500; }
-  td.num { text-align: right; font-variant-numeric: tabular-nums; }
-  td.invalid, td.cooling { color: #e6b455; }
-  td.disabled { color: #8896a6; }
-  td.ok { color: #7fd4a8; }
-</style>
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#171717" media="(prefers-color-scheme: dark)">
+<title>Usage · cproxy</title>
+<style>` + usageCSS + `</style>
 </head>
 <body>
-<h1><span>cproxy</span> usage</h1>
-<main id="stats" data-src="/usage?fragment=1{{if .TokenParam}}&amp;token={{.TokenParam}}{{end}}">
+<main>
+  <section class="page-head">
+    <div class="lede">
+      <h1><span class="brand">cproxy</span> usage</h1>
+      <p><code>{{.Version}}</code> · upstream <code>{{.Upstream}}</code> · up <span id="uptime">{{.Uptime}}</span></p>
+    </div>
+    <span id="live" class="presence presence-on" title="refreshes every 2s">live</span>
+  </section>
+  <div id="stats" data-src="/usage?fragment=1{{if .TokenParam}}&amp;token={{.TokenParam}}{{end}}">
 {{template "stats" .}}
+  </div>
 </main>
 <script>
 // Swap in the stats fragment every 2s. Inline on purpose: this page may
 // carry its client token in the URL, so it loads no third-party script.
 (function () {
-  var el = document.getElementById("stats");
+  var el = document.getElementById("stats"), live = document.getElementById("live");
+  function state(ok) {
+    live.className = ok ? "presence presence-on" : "presence presence-off";
+    live.textContent = ok ? "live" : "reconnecting";
+  }
   setInterval(function () {
     fetch(el.dataset.src, {cache: "no-store"})
-      .then(function (r) { return r.ok ? r.text() : null; })
-      .then(function (html) { if (html !== null) el.innerHTML = html; })
-      .catch(function () {});
+      .then(function (r) { return r.ok ? r.text() : Promise.reject(r.status); })
+      .then(function (html) { el.innerHTML = html; state(true); })
+      .catch(function () { state(false); });
   }, 2000);
 })();
 </script>
@@ -175,63 +246,182 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 		TokenParam: tokParam,
 	}
 
-	var accounts []pool.Account
-	clients := map[string]config.ClientAuth{}
-	if st.Runtime != nil {
-		accounts = st.Runtime.Accounts
-		clients = st.Runtime.ClientAuth
+	rt := st.Runtime
+	if rt == nil {
+		rt = &config.Runtime{DefaultPool: config.DefaultPoolName}
 	}
-
-	names := make([]string, len(accounts))
-	for i, a := range accounts {
+	names := make([]string, len(rt.Accounts))
+	for i, a := range rt.Accounts {
 		names[i] = a.Name
 	}
 	stats := s.sel.StatsSnapshot(names)
 	sticky := s.sel.StickySnapshot()
 	clientStats := s.sel.ClientStatsSnapshot()
 
-	for _, a := range accounts {
+	for _, a := range rt.Accounts {
 		stt := stats[a.Name]
 		apiData, apiErr := s.usage.snapshot(a.Name)
-		state, class := "ok", "ok"
-		switch {
-		case a.Disabled:
-			state, class = "disabled", "disabled"
-		case stt.Invalid:
-			state, class = "invalid token", "invalid"
-		case stt.CoolingUntil.After(now):
-			state, class = "cooling "+humanDur(stt.CoolingUntil.Sub(now)), "cooling"
-		}
-		data.Accounts = append(data.Accounts, accountRow{
+		row := accountRow{
 			Name:        a.Name,
 			Type:        string(a.Type),
-			Pools:       poolsLabel(a.Pools),
+			Pools:       rt.AccountPools(a),
 			Token:       pool.MaskToken(a.Token),
 			Requests:    stt.Requests,
 			RateLimited: stt.RateLimited,
 			Rejected:    stt.Rejected,
 			Errors:      stt.Errors,
-			State:       state,
-			StateClass:  class,
-			UsageAPI:    UsageAPISummary(apiData, apiErr, now),
-			RateLimits:  RateLimitsSummary(stt.RateLimits, now),
 			LastUsed:    ago(stt.LastUsed),
-		})
+		}
+		if !stt.LastUsed.IsZero() {
+			row.LastUsedAt = stt.LastUsed.Format(time.RFC3339)
+		}
+		if prof := s.usage.profile(a.Name); prof != nil {
+			row.Email, row.Org = prof.Email, prof.Organization
+		}
+		row.Initials, row.Hue = avatarFor(row.Name, row.Email)
+		switch {
+		case a.Disabled:
+			row.State = "disabled"
+			data.Unusable++
+		case stt.Invalid:
+			row.State, row.Tone = "invalid token", "danger"
+			data.Unusable++
+		case stt.CoolingUntil.After(now):
+			row.State, row.Tone = "cooling "+humanDur(stt.CoolingUntil.Sub(now)), "warn"
+			data.Cooling++
+		default:
+			row.State, row.Tone = "available", "ok"
+			data.Available++
+		}
+		if apiData != nil {
+			if w := apiData.FiveHour; w != nil {
+				row.Meters = append(row.Meters, newMeter("5-hour", w.Pct, w.ResetsAt, now))
+			}
+			if w := apiData.SevenDay; w != nil {
+				row.Meters = append(row.Meters, newMeter("7-day", w.Pct, w.ResetsAt, now))
+			}
+			for _, sc := range apiData.Scoped {
+				row.Meters = append(row.Meters, newMeter(sc.Name, sc.Pct, sc.ResetsAt, now))
+			}
+			if sp := apiData.Spend; sp != nil {
+				if sp.Limit != nil {
+					m := newMeter("Extra usage", sp.Pct, sp.ResetsAt, now)
+					m.Text = money(sp.Currency, sp.Used) + " / " + money(sp.Currency, sp.Limit)
+					row.Meters = append(row.Meters, m)
+				} else {
+					row.Spend = "Extra usage: " + money(sp.Currency, sp.Used) + " spent, no monthly limit"
+				}
+			}
+		} else {
+			row.UsageNote = apiErr
+			if stt.RateLimits != nil {
+				row.HeaderNote = RateLimitsSummary(stt.RateLimits, now)
+			}
+		}
+		data.Requests += stt.Requests
+		data.RateLimited += stt.RateLimited
+		data.Errors += stt.Errors
+		data.Accounts = append(data.Accounts, row)
 	}
 	slices.SortFunc(data.Accounts, func(a, b accountRow) int { return strings.Compare(a.Name, b.Name) })
 
-	for _, cca := range clients {
-		data.Clients = append(data.Clients, clientRow{
-			Name:     cca.Name,
-			Pool:     poolNameFor(cca),
-			Pinned:   pinnedLabel(sticky[poolNameFor(cca)+"|"+cca.Name]),
-			Requests: clientStats[cca.Name].Requests,
-			LastSeen: ago(clientStats[cca.Name].LastSeen),
-		})
+	// Configured clients, plus identities seen without one (run mode's
+	// "local" session, --no-auth's "anonymous").
+	seen := map[string]bool{}
+	addClient := func(ca config.ClientAuth) {
+		if seen[ca.Name] {
+			return
+		}
+		seen[ca.Name] = true
+		cs := clientStats[ca.Name]
+		pn := rt.PoolFor(ca)
+		row := clientRow{
+			Name:     ca.Name,
+			Pool:     pn,
+			Pinned:   sticky[pn+"|"+ca.Name],
+			Requests: cs.Requests,
+			LastSeen: ago(cs.LastSeen),
+			Active:   !cs.LastSeen.IsZero() && now.Sub(cs.LastSeen) < 2*time.Minute,
+		}
+		row.Initials, row.Hue = avatarFor(ca.Name, "")
+		if row.Active {
+			data.ActiveClients++
+		}
+		data.Clients = append(data.Clients, row)
+	}
+	for _, ca := range rt.ClientAuth {
+		addClient(ca)
+	}
+	for name := range clientStats {
+		addClient(config.ClientAuth{Name: name})
 	}
 	slices.SortFunc(data.Clients, func(a, b clientRow) int { return strings.Compare(a.Name, b.Name) })
 
 	return data
+}
+
+// newMeter builds a utilization bar: green below 70%, amber below 90%, red
+// from there.
+func newMeter(label string, pct float64, resets *time.Time, now time.Time) meter {
+	m := meter{Label: label, Text: pctStr(pct), Tone: "ok"}
+	switch {
+	case pct >= 90:
+		m.Tone = "danger"
+	case pct >= 70:
+		m.Tone = "warn"
+	}
+	m.Width = strconv.FormatFloat(math.Max(0, math.Min(100, pct)), 'f', 1, 64) + "%"
+	if resets != nil {
+		m.Reset = "resets in " + countdown(*resets, now)
+	}
+	return m
+}
+
+// money renders an amount with its currency ($12.40, EUR 3.10).
+func money(currency string, v *float64) string {
+	if v == nil {
+		return "–"
+	}
+	n := strconv.FormatFloat(*v, 'f', 2, 64)
+	switch currency {
+	case "", "USD":
+		return "$" + n
+	default:
+		return currency + " " + n
+	}
+}
+
+// avatarFor derives an avatar's initials and hue (0–5) from an email when
+// known, else from a name.
+func avatarFor(name, email string) (string, int) {
+	src := name
+	if email != "" {
+		src, _, _ = strings.Cut(email, "@")
+	}
+	var parts []string
+	for _, f := range strings.FieldsFunc(src, func(r rune) bool { return r == '.' || r == '-' || r == '_' || r == ' ' }) {
+		parts = append(parts, f)
+	}
+	ini := ""
+	switch {
+	case len(parts) >= 2:
+		ini = firstRune(parts[0]) + firstRune(parts[1])
+	case len(parts) == 1:
+		ini = firstRune(parts[0])
+		if r := []rune(parts[0]); len(r) > 1 {
+			ini += string(r[1])
+		}
+	}
+	h := fnv.New32a()
+	h.Write([]byte(email + "|" + name))
+	return strings.ToUpper(ini), int(h.Sum32() % 6)
+}
+
+func firstRune(s string) string {
+	for _, r := range s {
+		return string(r)
+	}
+	return ""
 }
 
 // UsageSnapshot is the wire shape of /usage?format=json — the same data as
@@ -246,6 +436,8 @@ type UsageSnapshot struct {
 
 type UsageAccount struct {
 	Name         string              `json:"name"`
+	Email        string              `json:"email,omitempty"`        // from the profile API
+	Organization string              `json:"organization,omitempty"` // from the profile API
 	Type         string              `json:"type"`
 	Pools        []string            `json:"pools"`
 	Token        string              `json:"token"` // masked
@@ -328,6 +520,9 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 			Invalid:     stt.Invalid,
 			Disabled:    a.Disabled,
 		}
+		if prof := s.usage.profile(a.Name); prof != nil {
+			row.Email, row.Organization = prof.Email, prof.Organization
+		}
 		if !stt.LastUsed.IsZero() {
 			t := stt.LastUsed
 			row.LastUsed = &t
@@ -341,10 +536,14 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 	slices.SortFunc(out.Accounts, func(a, b UsageAccount) int { return strings.Compare(a.Name, b.Name) })
 
 	for _, cca := range clients {
+		pn := config.DefaultPoolName
+		if st.Runtime != nil {
+			pn = st.Runtime.PoolFor(cca)
+		}
 		row := UsageClient{
 			Name:     cca.Name,
-			Pool:     poolNameFor(cca),
-			Pinned:   pinnedLabel(sticky[poolNameFor(cca)+"|"+cca.Name]),
+			Pool:     pn,
+			Pinned:   pinnedLabel(sticky[pn+"|"+cca.Name]),
 			Requests: clientStats[cca.Name].Requests,
 		}
 		if cs, ok := clientStats[cca.Name]; ok && !cs.LastSeen.IsZero() {
@@ -370,14 +569,6 @@ func pinnedLabel(pinned string) string {
 		return "—"
 	}
 	return pinned
-}
-
-// poolsLabel renders an account's pool membership compactly.
-func poolsLabel(pools []string) string {
-	if len(pools) == 0 {
-		return config.DefaultPoolName
-	}
-	return strings.Join(pools, ",")
 }
 
 // RateLimitsSummary renders the last-seen anthropic-ratelimit-* headers.
@@ -441,15 +632,31 @@ func ago(t time.Time) string {
 	return humanDur(time.Since(t).Round(time.Second)) + " ago"
 }
 
-func humanDur(d time.Duration) string {
-	switch {
-	case d < 0:
-		return "0s"
-	case d < time.Minute:
-		return d.Round(time.Second).String()
-	case d < time.Hour:
-		return d.Round(time.Minute).String()
-	default:
-		return d.Round(time.Hour).String()
+func humanDur(d time.Duration) string { return HumanDuration(d) }
+
+// HumanDuration renders a duration the way people say it: 26s, 47m,
+// 1h 32m, 3d 4h. Two units at most; the smaller one is dropped when zero.
+func HumanDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
 	}
+	two := func(a int64, au string, b int64, bu string) string {
+		if b == 0 {
+			return strconv.FormatInt(a, 10) + au
+		}
+		return strconv.FormatInt(a, 10) + au + " " + strconv.FormatInt(b, 10) + bu
+	}
+	s := int64(d.Round(time.Second) / time.Second)
+	if s < 60 {
+		return strconv.FormatInt(s, 10) + "s"
+	}
+	// Round to the smallest unit shown, so 4m59s reads 5m, not 4m.
+	if m := (s + 30) / 60; m < 24*60 {
+		if m < 60 {
+			return strconv.FormatInt(m, 10) + "m"
+		}
+		return two(m/60, "h", m%60, "m")
+	}
+	h := (s + 1800) / 3600
+	return two(h/24, "d", h%24, "h")
 }

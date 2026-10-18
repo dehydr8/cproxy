@@ -11,6 +11,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,6 +27,9 @@ import (
 
 const (
 	usageAPIPath     = "/api/oauth/usage"
+	profileAPIPath   = "/api/oauth/profile"
+	profileFreshFor  = 6 * time.Hour    // identities rarely change
+	profileRetry     = 5 * time.Minute  // after a transient failure
 	usageAPITimeout  = 5 * time.Second  // per account fetch
 	usageCycleBudget = 10 * time.Second // per background refresh cycle
 	usageTick        = 15 * time.Second // background poll cadence
@@ -98,22 +102,23 @@ type usageAPILimit struct {
 	ResetsAt string   `json:"resets_at"`
 }
 
-// fetchUsageAPI queries one account token against the usage API.
-func fetchUsageAPI(ctx context.Context, client *http.Client, upstream *url.URL, token string) (*UsageAPI, error) {
+// oauthGet performs one OAuth-authenticated GET against the upstream and
+// decodes a 200 JSON answer into out.
+func oauthGet(ctx context.Context, client *http.Client, upstream *url.URL, token, path string, out any) error {
 	u := *upstream
-	u.Path = strings.TrimSuffix(u.Path, "/") + usageAPIPath
+	u.Path = strings.TrimSuffix(u.Path, "/") + path
 	u.RawQuery = ""
 	u.Fragment = ""
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, fmt.Errorf("usage API: %w", err)
+		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
 	req.Header.Set("User-Agent", "cproxy/"+version.String()+" (github.com/dehydr8/cproxy)")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("usage API: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -121,13 +126,53 @@ func fetchUsageAPI(ctx context.Context, client *http.Client, upstream *url.URL, 
 		if secs, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && secs > 0 {
 			ra = time.Duration(secs) * time.Second
 		}
-		return nil, &usageAPIError{status: resp.StatusCode, retryAfter: ra}
+		return &usageAPIError{status: resp.StatusCode, retryAfter: ra}
 	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out); err != nil {
+		return fmt.Errorf("decoding response: %w", err)
+	}
+	return nil
+}
+
+// fetchUsageAPI queries one account token against the usage API.
+func fetchUsageAPI(ctx context.Context, client *http.Client, upstream *url.URL, token string) (*UsageAPI, error) {
 	var raw usageAPIResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&raw); err != nil {
-		return nil, fmt.Errorf("usage API: decoding response: %w", err)
+	if err := oauthGet(ctx, client, upstream, token, usageAPIPath, &raw); err != nil {
+		var ue *usageAPIError
+		if errors.As(err, &ue) {
+			return nil, ue
+		}
+		return nil, fmt.Errorf("usage API: %w", err)
 	}
 	return raw.usage(time.Now()), nil
+}
+
+// AccountProfile is who an OAuth account token belongs to, from
+// GET /api/oauth/profile (needs the user:profile scope).
+type AccountProfile struct {
+	Email        string `json:"email,omitempty"`
+	Organization string `json:"organization,omitempty"`
+}
+
+// fetchProfile resolves an OAuth token to its account identity.
+func fetchProfile(ctx context.Context, client *http.Client, upstream *url.URL, token string) (*AccountProfile, error) {
+	var raw struct {
+		Account struct {
+			Email        string `json:"email"`
+			EmailAddress string `json:"email_address"`
+		} `json:"account"`
+		Organization struct {
+			Name string `json:"name"`
+		} `json:"organization"`
+	}
+	if err := oauthGet(ctx, client, upstream, token, profileAPIPath, &raw); err != nil {
+		return nil, err
+	}
+	p := &AccountProfile{Email: raw.Account.Email, Organization: raw.Organization.Name}
+	if p.Email == "" {
+		p.Email = raw.Account.EmailAddress
+	}
+	return p, nil
 }
 
 // usage converts the wire response into the normalized snapshot.
@@ -193,6 +238,9 @@ type usageEntry struct {
 	fetchedAt time.Time
 	retryAt   time.Time
 	backoff   time.Duration
+
+	profile        *AccountProfile // kept across failed refreshes
+	profileRetryAt time.Time
 }
 
 func (p *usagePoller) due(name string, now time.Time) bool {
@@ -245,6 +293,47 @@ func (e *usageEntry) nextBackoff() time.Duration {
 	return e.backoff
 }
 
+// profileDue reports whether an account's identity should be (re)fetched.
+func (p *usagePoller) profileDue(name string, now time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.entries[name]
+	return e == nil || !e.profileRetryAt.After(now)
+}
+
+// recordProfile stores a profile fetch result. A failure keeps any profile
+// already known: an identity does not go stale the way usage numbers do.
+func (p *usagePoller) recordProfile(name string, prof *AccountProfile, err error, now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.entries[name]
+	if e == nil {
+		e = &usageEntry{}
+		p.entries[name] = e
+	}
+	if err == nil {
+		e.profile = prof
+		e.profileRetryAt = now.Add(profileFreshFor)
+		return
+	}
+	var ue *usageAPIError
+	if errors.As(err, &ue) && (ue.status == http.StatusForbidden || ue.status == http.StatusUnauthorized) {
+		e.profileRetryAt = now.Add(usageForbidden)
+		return
+	}
+	e.profileRetryAt = now.Add(profileRetry)
+}
+
+// profile returns an account's cached identity, or nil.
+func (p *usagePoller) profile(name string) *AccountProfile {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e := p.entries[name]; e != nil {
+		return e.profile
+	}
+	return nil
+}
+
 // forget drops an account's cached result and backoff so the next cycle
 // fetches it afresh.
 func (p *usagePoller) forget(name string) {
@@ -278,14 +367,18 @@ func (s *Server) pollUsageOnce(ctx context.Context) {
 		if a.Type != pool.TokenTypeOAuth || a.Token == "" {
 			continue
 		}
-		now := time.Now()
-		if !s.usage.due(a.Name, now) {
-			continue
+		if s.usage.due(a.Name, time.Now()) {
+			fctx, cancel := context.WithTimeout(ctx, usageAPITimeout)
+			data, err := fetchUsageAPI(fctx, s.client, s.upstream, a.Token)
+			cancel()
+			s.usage.record(a.Name, data, err, time.Now())
 		}
-		fctx, cancel := context.WithTimeout(ctx, usageAPITimeout)
-		data, err := fetchUsageAPI(fctx, s.client, s.upstream, a.Token)
-		cancel()
-		s.usage.record(a.Name, data, err, time.Now())
+		if ctx.Err() == nil && s.usage.profileDue(a.Name, time.Now()) {
+			fctx, cancel := context.WithTimeout(ctx, usageAPITimeout)
+			prof, err := fetchProfile(fctx, s.client, s.upstream, a.Token)
+			cancel()
+			s.usage.recordProfile(a.Name, prof, err, time.Now())
+		}
 	}
 }
 

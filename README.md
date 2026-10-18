@@ -142,21 +142,36 @@ orbs, CI, or anywhere you don't want a credentials file:
 
 | Variable | Meaning |
 | --- | --- |
-| `CPROXY_TOKENS` | accounts for the default pool: `name:token,name:token` |
-| `CPROXY_POOL_TOKENS_<NAME>` | accounts for pool `<NAME>` (uppercased): `cvp1:tok,cvp2:tok` |
+| `CPROXY_TOKEN_<NAME>` | one account `<name>` in the default pool |
+| `CPROXY_POOL_TOKEN_<POOL>_<NAME>` | one account `<pool>-<name>` in pool `<pool>` |
+| `CPROXY_POOL` | the pool to use when `--pool` is not given (default `default`) |
+| `CPROXY_TOKENS` | several default-pool accounts in one variable: `name:token,name:token` |
+| `CPROXY_POOL_TOKENS_<POOL>` | several accounts for pool `<pool>`: `cvp1:tok,cvp2:tok` |
 | `CPROXY_CLIENT_TOKENS` | serve-mode client tokens: `name:token[:scopes]`, scopes `+`-separated |
 | `CPROXY_UPSTREAM` | upstream base URL (default `https://api.anthropic.com`) |
 | `CPROXY_HOME` | config directory (default `~/.cproxy`) |
 
-```sh
-CPROXY_TOKENS=main:sk-ant-oat01-…,alt:sk-ant-oat01-… \
-  cproxy run -- claude
+One variable per account is the easiest to manage as secrets: adding,
+rotating or removing an account touches only its own variable.
 
-CPROXY_POOL_TOKENS_CVP=cvp1:sk-…,cvp2:sk-… \
-  cproxy run --pool cvp -- claude
+```sh
+# accounts "abc" and "xyz" in the default pool
+CPROXY_TOKEN_ABC=sk-ant-oat01-…
+CPROXY_TOKEN_XYZ=sk-ant-oat01-…
+
+# accounts "cvp-a" and "cvp-b" in pool "cvp", used because CPROXY_POOL says so
+CPROXY_POOL_TOKEN_CVP_A=sk-ant-oat01-…
+CPROXY_POOL_TOKEN_CVP_B=sk-ant-oat01-…
+CPROXY_POOL=cvp
 ```
 
-Env entries override same-named file entries; flags override both.
+Names are lowercased. Pool account names carry their pool as a prefix,
+because account names are global (cooldowns and sticky pins are keyed by
+them), and pool names cannot contain `_`. The same token under several
+variables becomes one account in all of their pools, so one subscription is
+never tracked twice. Env entries override same-named file entries; flags
+override both. In Amp, keep the tokens in your personal env and set
+`CPROXY_POOL` per project.
 
 ## Commands
 
@@ -214,11 +229,12 @@ someone who should see pool health but never spend it.
 
 Serve mode exposes `/usage`:
 
-- **HTML** (auto-refreshes every 2s; no external scripts): accounts with request counts, 429s,
-  cooldown state, sticky pin per client, real utilization from Anthropic's
-  usage API, and the last-seen
-  `anthropic-ratelimit-*` values from upstream — e.g.
-  `blocked · req 0/50 · tok 38.0k/40.0k · reset req 2m0s/tok 32m0s`.
+- **HTML** (light and dark, refreshes every 2s, no external scripts):
+  headline tiles, then each account with its email, state, 5-hour / 7-day /
+  per-model / extra-usage meters, request and 429 counts, and each client
+  with its pool, pinned account and last activity. Accounts without usage
+  API access show the last `anthropic-ratelimit-*` headers instead, e.g.
+  `req 38/50 · tok 31.2k/40.0k · reset tok 26s`.
 - **JSON**: `GET /usage?format=json` for scripts and alerting.
 - **Fragment**: `GET /usage?fragment=1` returns just the stats tables.
 - **Terminal**: `cproxy usage [--port N] [--json]` prints the live table in a
@@ -238,9 +254,11 @@ token can answer it:
 1. **Real usage API** (preferred): cproxy polls
    `GET /api/oauth/usage` in the background — lazily, starting with the first
    usage view — and shows per-account 5-hour and 7-day utilization
-   (`5h 42.5% (resets 1h30m) · 7d 12%`), spend with its monthly limit
+   (`5h 42.5% (resets 1h 30m) · 7d 12%`), spend with its monthly limit
    (`spend USD 25.5/500`) and per-model weekly limits (`Fable 20%`), as
-   `usage_api` in the JSON. This needs the `user:profile` scope — which
+   `usage_api` in the JSON. The same tokens also answer
+   `GET /api/oauth/profile`, so each account shows the email it belongs to
+   (`email` / `organization` in the JSON). This needs the `user:profile` scope — which
    `cproxy setup-token` mints by default. Tokens that cannot query it (an
    inference-only token, a revoked one) show a note like
    `usage API: 403 (token needs the user:profile scope)` instead, and back off
@@ -283,7 +301,8 @@ and machines without cproxy behave exactly as before.
 1. Install cproxy in the orb and wrap `claude` (the post-install script
    below does both).
 2. In Amp's **Secrets & Env Vars** (personal or project), add
-   `CPROXY_TOKENS` (or `CPROXY_POOL_TOKENS_<NAME>`) — the pooled account
+   `CPROXY_TOKEN_<NAME>` per account (or `CPROXY_POOL_TOKEN_<POOL>_<NAME>`
+   plus `CPROXY_POOL`, or the list forms) — the pooled account
    tokens, marked as secrets. That is all claude needs; the wrapper creates
    its own local client token. Optionally add `CPROXY_CLIENT_TOKENS`, e.g.
    `monitor:cp_…:usage` for a dashboard-only viewer.

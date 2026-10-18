@@ -116,6 +116,10 @@ func TestUsageAPIPollerPreferredOverHeaders(t *testing.T) {
 			io.WriteString(w, cannedUsageAPI)
 			return
 		}
+		if h.path == profileAPIPath {
+			io.WriteString(w, `{"account": {"uuid": "u1", "email": "main@example.com"}, "organization": {"name": "Acme"}}`)
+			return
+		}
 		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "allowed")
 		w.Header().Set("Anthropic-Ratelimit-Requests-Limit", "50")
 		w.Header().Set("Anthropic-Ratelimit-Requests-Remaining", "42")
@@ -201,16 +205,30 @@ func TestUsageAPIPollerPreferredOverHeaders(t *testing.T) {
 	// The dashboard renders the real numbers.
 	frag := doReq(t, "GET", ts.URL+"/usage?fragment=1", bearerHeaders("cp_alice"), "")
 	b, _ := io.ReadAll(frag.Body)
-	for _, want := range []string{"5h 42.5%", "7d 12%", "spend USD 25.5/500", "Fable 20%", "req 42/50"} {
+	for _, want := range []string{"42.5%", "12%", "$25.50 / $500.00", "Fable", "20%", "main@example.com"} {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("fragment missing %q:\n%s", want, b)
 		}
 	}
+	// Real numbers win: the header fallback is only shown without them.
+	if strings.Contains(string(b), "from response headers") {
+		t.Fatalf("header fallback shown next to usage API numbers:\n%s", b)
+	}
 
-	// Fresh entries are not re-fetched on the next cycle (60s TTL).
+	// Fresh entries are not re-fetched on the next cycle (60s TTL), and
+	// the identity is fetched once.
 	srv.pollUsageOnce(ctx)
 	if got := len(usageAPIHits(t, up)); got != 1 {
 		t.Fatalf("usage API re-fetched while fresh: %d hits", got)
+	}
+	profiles := 0
+	for _, h := range up.recorded() {
+		if h.path == profileAPIPath {
+			profiles++
+		}
+	}
+	if profiles != 1 {
+		t.Fatalf("profile fetched %d times; want once, for the OAuth account only", profiles)
 	}
 }
 
@@ -310,7 +328,7 @@ func TestUsageAPISummary(t *testing.T) {
 		FiveHour: &UsageAPIWindow{Pct: 42.5, ResetsAt: ptrTime(now.Add(2 * time.Hour))},
 		SevenDay: &UsageAPIWindow{Pct: 12},
 	}
-	if got := UsageAPISummary(u, "", now); got != "5h 42.5% (resets 2h0m0s) · 7d 12%" {
+	if got := UsageAPISummary(u, "", now); got != "5h 42.5% (resets 2h) · 7d 12%" {
 		t.Fatalf("summary: %q", got)
 	}
 	if got := UsageAPISummary(nil, "usage API: 403 (token needs the user:profile scope)", now); got != "usage API: 403 (token needs the user:profile scope)" {
