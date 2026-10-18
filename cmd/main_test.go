@@ -10,6 +10,12 @@ import (
 // the developer's own pool tokens must never leak into a test (or its
 // failure output), and every test sets exactly what it needs.
 func TestMain(m *testing.M) {
+	// Tests that start the daemon spawn this binary as `<test> daemon`.
+	if len(os.Args) == 2 && os.Args[1] == "daemon" {
+		rootCmd.SetArgs([]string{"daemon"})
+		Execute()
+		os.Exit(0)
+	}
 	scrubEnv()
 	os.Exit(m.Run())
 }

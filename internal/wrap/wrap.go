@@ -1,7 +1,7 @@
 // Package wrap turns the installed claude binary into a shim over cproxy:
 // Install replaces it with a tiny script that runs `cproxy claude`, and
-// Decide picks the client credential that command presents to the shared
-// serve instance.
+// Decide picks the client credential that command presents to the local
+// daemon.
 package wrap
 
 import (
@@ -121,7 +121,7 @@ func Uninstall(claudePath string) (restored string, err error) {
 type Plan int
 
 const (
-	// PlanProxy routes claude through the shared local serve instance.
+	// PlanProxy routes claude through the local daemon.
 	PlanProxy Plan = iota
 	// PlanPassThrough runs claude completely untouched.
 	PlanPassThrough

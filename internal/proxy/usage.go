@@ -118,7 +118,7 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
   <div class="table-toolbar"><h2>Accounts<span class="count">{{len .Accounts}}</span></h2></div>
   <div class="table-wrap">
   {{if .Accounts}}
-  <table>
+  <table class="cards">
     <thead><tr><th scope="col">Account</th><th scope="col">State</th><th scope="col" class="fill">Usage</th>
       <th scope="col" class="num">Requests</th><th scope="col" class="num">429s</th><th scope="col" class="num col-errors">Errors</th>
       <th scope="col" class="col-when">Last used</th><th scope="col" class="col-token">Token</th></tr></thead>
@@ -142,10 +142,10 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
         {{if .HeaderNote}}<div class="note">from response headers{{if not .Meters}}:{{end}} {{.HeaderNote}}</div>{{end}}
         {{if not (or .Meters .Spend .UsageNote .HeaderNote)}}<span class="faint">no usage seen yet</span>{{end}}
       </td>
-      <td class="num">{{.Requests}}{{if .Tokens}}<div class="sub" title="{{.TokensTitle}}">{{.Tokens}}</div>{{end}}</td>
-      <td class="num{{if .RateLimited}} warn-fg{{end}}">{{.RateLimited}}</td>
-      <td class="num col-errors{{if .Errors}} warn-fg{{end}}">{{.Errors}}</td>
-      <td class="nowrap col-when"{{if .LastUsedAt}} title="{{.LastUsedAt}}"{{end}}>{{.LastUsed}}</td>
+      <td class="num stat" data-label="requests">{{.Requests}}{{if .Tokens}}<div class="sub" title="{{.TokensTitle}}">{{.Tokens}}</div>{{end}}</td>
+      <td class="num stat{{if .RateLimited}} warn-fg{{end}}" data-label="429s">{{.RateLimited}}</td>
+      <td class="num stat col-errors{{if .Errors}} warn-fg{{end}}" data-label="errors">{{.Errors}}</td>
+      <td class="nowrap stat col-when" data-label="last used"{{if .LastUsedAt}} title="{{.LastUsedAt}}"{{end}}>{{.LastUsed}}</td>
       <td class="col-token"><code>{{.Token}}</code></td>
     </tr>
     {{end}}
@@ -159,18 +159,18 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
   <div class="table-toolbar"><h2>Clients<span class="count">{{len .Clients}}</span></h2></div>
   <div class="table-wrap">
   {{if .Clients}}
-  <table>
+  <table class="cards">
     <thead><tr><th scope="col" class="fill">Client</th><th scope="col">Pool</th><th scope="col">Pinned account</th>
       <th scope="col" class="num">Requests</th><th scope="col" class="num">Tokens</th><th scope="col" class="col-when">Last seen</th></tr></thead>
     <tbody>
     {{range .Clients}}
     <tr data-client="{{.Name}}">
       <td class="fill"><span class="identity identity-compact"><span class="avatar hue-{{.Hue}}" aria-hidden="true">{{.Initials}}</span><span class="identity-name truncate">{{.Name}}</span></span></td>
-      <td><span class="chip chip-tag">{{.Pool}}</span></td>
-      <td>{{if .Pinned}}<code>{{.Pinned}}</code>{{else}}<span class="faint">–</span>{{end}}</td>
-      <td class="num">{{.Requests}}</td>
-      <td class="num nowrap">{{if .Tokens}}{{.Tokens}}{{else}}<span class="faint">–</span>{{end}}</td>
-      <td class="col-when">{{if .Live}}<span class="presence presence-live">streaming</span>{{else if .Active}}<span class="presence presence-on">active</span>{{else}}<span class="presence">{{.LastSeen}}</span>{{end}}</td>
+      <td class="stat" data-label="pool"><span class="chip chip-tag">{{.Pool}}</span></td>
+      <td class="stat" data-label="pinned">{{if .Pinned}}<code>{{.Pinned}}</code>{{else}}<span class="faint">–</span>{{end}}</td>
+      <td class="num stat" data-label="requests">{{.Requests}}</td>
+      <td class="num nowrap stat" data-label="tokens">{{if .Tokens}}{{.Tokens}}{{else}}<span class="faint">–</span>{{end}}</td>
+      <td class="col-when stat">{{if .Live}}<span class="presence presence-live">streaming</span>{{else if .Active}}<span class="presence presence-on">active</span>{{else}}<span class="presence">{{.LastSeen}}</span>{{end}}</td>
     </tr>
     {{end}}
     </tbody>
@@ -430,15 +430,38 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 		}
 		data.Clients = append(data.Clients, row)
 	}
-	for _, ca := range rt.ClientAuth {
+	for _, ca := range s.clientList(st, clientStats) {
 		addClient(ca)
-	}
-	for name := range clientStats {
-		addClient(config.ClientAuth{Name: name})
 	}
 	slices.SortFunc(data.Clients, func(a, b clientRow) int { return strings.Compare(a.Name, b.Name) })
 
 	return data
+}
+
+// clientList is every client worth a row: configured ones, runtime-
+// registered ones, and identities only seen in traffic (run mode's
+// "local"); one per name, without the built-in dashboard viewer.
+func (s *Server) clientList(st *State, seen map[string]pool.ClientStats) []config.ClientAuth {
+	var out []config.ClientAuth
+	names := map[string]bool{config.DashboardClientName: true}
+	add := func(ca config.ClientAuth) {
+		if !names[ca.Name] {
+			names[ca.Name] = true
+			out = append(out, ca)
+		}
+	}
+	if st.Runtime != nil {
+		for _, ca := range st.Runtime.ClientAuth {
+			add(ca)
+		}
+	}
+	for _, ca := range s.Clients() {
+		add(ca)
+	}
+	for name := range seen {
+		add(config.ClientAuth{Name: name})
+	}
+	return out
 }
 
 // pinnedSummary renders the clients pinned to an account: up to two names
@@ -579,6 +602,15 @@ type UsageClient struct {
 	Tokens   pool.TokenUsage `json:"tokens"`
 }
 
+// UsageJSON serves the usage snapshot (as /usage?format=json) without
+// authentication, for the daemon's private control socket.
+func (s *Server) UsageJSON() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.ensureUsageWarm()
+		s.serveUsageJSON(w, s.state.Load())
+	})
+}
+
 func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 	now := time.Now()
 	out := UsageSnapshot{
@@ -590,10 +622,8 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 	}
 
 	var accounts []pool.Account
-	clients := map[string]config.ClientAuth{}
 	if st.Runtime != nil {
 		accounts = st.Runtime.Accounts
-		clients = st.Runtime.ClientAuth
 	}
 
 	names := make([]string, len(accounts))
@@ -663,7 +693,7 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 	}
 	slices.SortFunc(out.Accounts, func(a, b UsageAccount) int { return strings.Compare(a.Name, b.Name) })
 
-	for _, cca := range clients {
+	for _, cca := range s.clientList(st, clientStats) {
 		pn := config.DefaultPoolName
 		if st.Runtime != nil {
 			pn = st.Runtime.PoolFor(cca)

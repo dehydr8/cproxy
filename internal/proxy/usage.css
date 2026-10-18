@@ -240,3 +240,35 @@ td.num .sub { font-size: 11.5px; line-height: 14px; color: var(--faint-foregroun
   body { padding: 0; }
   main { border-radius: 0; min-height: 100vh; }
 }
+
+/* Phones: every table row becomes a card — who and state first, then the
+   usage meters, then the counts as small labelled stats — so nothing needs
+   sideways scrolling. */
+@media (max-width: 760px) {
+  .table-wrap { overflow: visible; }
+  table.cards thead { display: none; }
+  table.cards, table.cards tbody, table.cards tr { display: block; width: auto; }
+  table.cards tr { padding: 12px 16px; }
+  table.cards tbody tr + tr { border-top: 1px solid var(--border); }
+  table.cards td {
+    display: block; height: auto; width: auto !important; max-width: none; min-width: 0;
+    padding: 0 !important; border: 0 !important; text-align: left; white-space: normal;
+  }
+  table.cards tbody tr:hover td { background: none; }
+  table.cards td + td { margin-top: 10px; }
+  table.cards td.stat {
+    display: inline-flex; flex-direction: column; vertical-align: top;
+    margin: 12px 18px 0 0; font-variant-numeric: tabular-nums;
+  }
+  table.cards td.stat + td.stat { margin-top: 12px; }
+  table.cards td.stat[data-label]::before {
+    content: attr(data-label); font-size: 11px; line-height: 14px; color: var(--muted-foreground);
+    text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px;
+  }
+  table.cards td.stat .sub { margin-top: 0; }
+  table.cards .col-errors, table.cards .col-token { display: none; }
+  td.usage { min-width: 0; }
+  .meters { grid-template-columns: repeat(auto-fill, minmax(8rem, 1fr)); }
+  .state-sub, .identity-sub { max-width: none; }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

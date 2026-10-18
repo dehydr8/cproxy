@@ -67,10 +67,12 @@ go build -o /usr/local/bin/cproxy .
 
 ## Two ways to run it
 
-- **Local**: the pool tokens live on the machine running Claude. `cproxy run
-  -- claude` proxies one launch; `cproxy install` routes every `claude`
-  launch through a shared local serve (see below, and
-  [Using it inside Amp](#using-it-inside-amp)).
+- **Local**: the pool tokens live on the machine running Claude. One
+  per-user **daemon** serves every Claude on the machine — launched with
+  `cproxy run`, through the installed `claude` shim, from Paseo profiles or
+  scripts — so they share one set of sticky pins, cooldowns and usage, and
+  one dashboard. See [The local daemon](#the-local-daemon) and
+  [Using it inside Amp](#using-it-inside-amp).
 - **Remote**: one `cproxy serve` holds the pool tokens and several people or
   machines use it. Clients only need its URL and a client token; see
   [Hosting a shared cproxy](#hosting-a-shared-cproxy).
@@ -81,17 +83,58 @@ go build -o /usr/local/bin/cproxy .
 # Mint a long-lived token with the account you want to pool (browser sign-in).
 cproxy setup-token | cproxy accounts add cvp1 --pool cvp
 
-# Launch Claude through the local proxy, drawing from the "cvp" pool.
-cproxy run --pool cvp -- claude
+# Launch Claude through the local daemon, drawing from the "cvp" pool.
+cproxy run --pool cvp
+
+# See how the pool is doing, in the terminal or the browser.
+cproxy usage
+cproxy dashboard
 ```
 
-`cproxy run` starts a local proxy, then launches the command with
-`ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` and a generated
-`ANTHROPIC_AUTH_TOKEN` pointing at it. Ambient Anthropic credentials and
-`CPROXY_*` secrets are stripped from the child's environment, so the selected
-pool is the only thing the child can use. The child shares cproxy's process
+`cproxy run` starts the local daemon on first use (later launches reuse it),
+then launches the command — `claude` by default — with `ANTHROPIC_BASE_URL`
+and `ANTHROPIC_AUTH_TOKEN` pointed at it. Arguments after `--` that start
+with a flag go to claude, so `cproxy run --pool cvp -- --resume x` works
+like cswap's run. Ambient Anthropic credentials and `CPROXY_*` secrets are
+stripped from the child's environment. The child shares cproxy's process
 group (Ctrl+C reaches it directly), and cproxy exits with the child's exit
-code.
+code. `--isolated` runs a private proxy for one launch instead.
+
+Paseo (or any launcher) profiles become one line each:
+
+```json
+"claude-cvp": {
+  "extends": "claude",
+  "label": "Claude (CVP)",
+  "command": ["/home/me/.local/bin/cproxy", "run", "--pool", "cvp", "--"]
+}
+```
+
+## The local daemon
+
+There is one daemon per user, started by the first `cproxy run`,
+`cproxy claude` (the shim) or `cproxy dashboard`, and shared by every later
+launch — like flyctl's agent:
+
+- **One instance**, guaranteed by an exclusive lock (`~/.cproxy/daemon.lock`);
+  concurrent first launches race safely and end up on the same daemon.
+- **Claude talks to it on `127.0.0.1`** (`$CPROXY_PORT`, else 7788, else any
+  free port when 7788 is taken, e.g. by another user).
+- **cproxy talks to it over a private unix socket** (`~/.cproxy/cproxy.sock`,
+  `0600`): `cproxy usage` and `cproxy dashboard` need no token or port.
+- **Configuration follows the launches.** Every launch hands the daemon its
+  `CPROXY_*` variables; when they differ from what the daemon runs with, it
+  reloads in place (the last launch wins). Edits to `credentials.json` are
+  picked up within ~2s.
+- **Upgrades hand over without dropping anything.** A launch from a newer
+  cproxy release asks the running daemon to hand over: it stops listening at
+  once, a fresh daemon takes the port, and the old one finishes the streams
+  it was serving.
+- **Identities.** Every launch on the default pool shares one identity
+  (`claude-local`) and so one sticky account; `cproxy run --pool cvp`
+  launches share `claude-local@cvp`.
+
+It logs to `~/.cproxy/daemon.log`; `cproxy daemon` runs it in the foreground.
 
 ## Wrapping the claude command (`cproxy install`)
 
@@ -109,16 +152,14 @@ just execs `cproxy claude --exec <real binary>`, which on every launch:
 
 1. picks the client token claude will present: `$CPROXY_AUTH_TOKEN`, a
    matching `$ANTHROPIC_AUTH_TOKEN`, or the first proxy-scoped client token
-   in `$CPROXY_CLIENT_TOKENS` / `credentials.json`. With none configured it
-   creates a private local token (`~/.cproxy/local-token`, `0600`) shared
-   with the serve it starts, so pool accounts alone are enough;
-2. starts a shared `cproxy serve` on `127.0.0.1:7788` (`$CPROXY_PORT`) if
-   nothing is listening there yet — inheriting the current environment, so
-   env-configured credentials just work — logging to `~/.cproxy/serve.log`;
-   then checks that whatever listens there is a cproxy holding that client
-   token (a challenge that never sends the token itself), so the token is
-   never handed to another program on the port and a stale serve is
-   reported with the `kill <pid>` to fix it;
+   in `$CPROXY_CLIENT_TOKEN_*` / `$CPROXY_CLIENT_TOKENS` / `credentials.json`.
+   With none configured it uses the private local token
+   (`~/.cproxy/local-token`, `0600`, created once), so pool accounts alone
+   are enough;
+2. makes sure [the local daemon](#the-local-daemon) runs and has this
+   launch's configuration, then checks that the daemon's port really is a
+   cproxy holding that token (a challenge that never sends the token
+   itself);
 3. launches the real claude with `ANTHROPIC_BASE_URL` /
    `ANTHROPIC_AUTH_TOKEN` pointed at it (and `CPROXY_*` secrets stripped).
 
@@ -202,11 +243,13 @@ override both. In Amp, keep the tokens in your personal env and set
 
 | Command | What it does |
 | --- | --- |
-| `cproxy run [--pool P] [-- cmd…]` | start a local proxy and launch `cmd` (default `claude`) through it |
-| `cproxy serve [--addr :7788]` | run as a shared server with client-token auth |
+| `cproxy run [--pool P] [--isolated] [-- args…]` | launch claude (or a command) through the local daemon |
+| `cproxy usage [--json] [--port N]` | live usage in the terminal: per-account bars, clients (the daemon, or a serve with `--port`) |
+| `cproxy dashboard` | print a link to the live dashboard (view-only token included) |
 | `cproxy install [--path P]` | replace the `claude` binary with the cproxy shim (undo: `cproxy uninstall`) |
-| `cproxy claude [--port N] [-- cmd…]` | run the real claude through the shared local serve (what the shim execs) |
-| `cproxy usage [--port N] [--json]` | print live usage of a running serve instance in the terminal |
+| `cproxy claude [-- args…]` | run the real claude through the local daemon (what the shim execs) |
+| `cproxy daemon` | run the per-user local daemon in the foreground (normally started for you) |
+| `cproxy serve [--addr :7788] [--usage-addr A]` | run as a shared server with client-token auth |
 | `cproxy setup-token` | mint a long-lived Anthropic OAuth token via browser sign-in |
 | `cproxy accounts add/disable/enable/remove/list` | manage pool accounts in `credentials.json` |
 | `cproxy pools` | list pools, strategies and members |
@@ -316,22 +359,28 @@ them, and a restart (deploy, `fly secrets set`) starts them fresh.
 
 ## Usage dashboard
 
-Serve mode exposes `/usage`:
+The local daemon and `cproxy serve` expose `/usage`:
 
-- **HTML** (light and dark, refreshes every 2s, no external scripts):
-  headline tiles, then each account with its email and plan, state, 5-hour /
-  7-day / per-model / extra-usage meters, request and 429 counts, and each
-  client with its pool, pinned account and last activity. Accounts without
+- **Browser**: `cproxy dashboard` prints a link to the local daemon's page
+  with a generated view-only token (`~/.cproxy/dashboard-token`) in it — no
+  token to configure. Light and dark, refreshes every 2s without jumping, no
+  external scripts, and laid out as cards on phones. It shows headline tiles
+  (accounts, requests and how many are streaming now, tokens, 429s,
+  clients), then each account with its email and plan, state, which clients
+  are pinned to it, 5-hour / 7-day / per-model / extra-usage meters, requests
+  and tokens, and each client with its pool, pinned account, tokens and
+  whether it is streaming. Accounts without
   usage API access get their 5-hour / 7-day meters from the last response's
   `anthropic-ratelimit-unified-*` headers, or (API keys) a summary like
   `req 38/50 · tok 31.2k/40.0k · reset tok 26s`.
 - **JSON**: `GET /usage?format=json` for scripts and alerting.
 - **Fragment**: `GET /usage?fragment=1` returns just the stats tables.
-- **Terminal**: `cproxy usage [--port N] [--json]` prints the live table in a
-  shell, authenticating with a client token from the same places serve reads
-  them (env or `credentials.json`); it needs the `usage` scope. Only a shared
-  serve instance (serve, or the wrapper's spawned one) can be queried — a
-  one-shot `cproxy run` session keeps its port and session token to itself.
+- **Terminal**: `cproxy usage` prints each account as a block of bar meters
+  (green / amber from 70% / red from 90% in a terminal) with resets, spend,
+  requests and tokens, then the clients. It asks the local daemon over its
+  socket, so no token is needed; with `--port` it asks a `cproxy serve` on
+  that port instead, with a usage-capable client token from the usual
+  places. `--json` prints the raw JSON.
 
 Auth is a client token via the `Authorization` header, or — since browsers
 can't set headers — `GET /usage?token=cp_…` (the token stays in the URL, so
@@ -397,10 +446,10 @@ and machines without cproxy behave exactly as before.
    tokens, marked as secrets. That is all claude needs; the wrapper creates
    its own local client token. Optionally add `CPROXY_CLIENT_TOKENS`, e.g.
    `monitor:cp_…:usage` for a dashboard-only viewer.
-3. The first `claude` launch in an orb starts serve on `127.0.0.1:7788`
-   (inheriting those env vars) and injects the routing into claude. Each
-   Amp thread gets a stable client identity, sticks to one account, and
-   fails over on 429.
+3. The first `claude` launch in an orb starts [the local
+   daemon](#the-local-daemon) with those env vars and injects the routing
+   into claude; it sticks to one account, moves on before that account runs
+   out, and fails over on 429.
 4. Every launch also registers the `/usage` dashboard as an orb portal
    named **cproxy usage**, so the live dashboard is one click away in the
    thread. Its link carries a generated usage-only token
@@ -446,6 +495,8 @@ is harmless; it reinstalls the shim after Claude Code updates.
 - Client tokens are the only thing other users ever hold; revoke them by
   removing them from `credentials.json` (picked up automatically) or from
   the environment (restart serve).
+- The local daemon's control socket is `0600` in your `0700` `~/.cproxy`:
+  only you can reach it, which is why it needs no token.
 - `credentials.json` is written with `0600` and contains raw tokens — protect
   the home directory accordingly.
 - Serve beyond localhost only with TLS or a terminating proxy in front.
@@ -459,4 +510,5 @@ go build ./... && go vet ./... && go test ./...
 Layout: `cmd/` (cobra commands), `internal/config` (file + env config),
 `internal/pool` (strategies, cooldowns, stats), `internal/proxy` (handler,
 failover, usage dashboard), `internal/launch` (child process launching),
-`internal/wrap` (claude shim install + shared-serve bootstrap).
+`internal/daemon` (the local daemon's lock, socket and control protocol),
+`internal/wrap` (claude shim install, daemon bootstrap, orb portal).

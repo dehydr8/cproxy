@@ -71,6 +71,8 @@ type Server struct {
 	started   time.Time // for the usage dashboard's uptime
 	hideUsage bool
 
+	ephemeral sync.Map // client token -> config.ClientAuth registered at runtime (cproxy run via the daemon)
+
 	usage       *usagePoller // real usage API cache (preferred usage source)
 	usageStop   chan struct{}
 	usageWarm   chan struct{} // closed after the poller's first cycle
@@ -138,6 +140,47 @@ func (s *Server) Selector() *pool.Selector { return s.sel }
 func (s *Server) ForgetAccount(name string) {
 	s.sel.ClearAccount(name)
 	s.usage.forget(name)
+}
+
+// AddClient registers a client token for as long as this process runs (or
+// until RemoveClient), independent of configuration reloads. The local
+// daemon gives every claude and `cproxy run` its own, so each gets its own
+// sticky pin and its own row on the dashboard.
+func (s *Server) AddClient(token string, ca config.ClientAuth) { s.ephemeral.Store(token, ca) }
+
+// RemoveClient drops a registered client and forgets its stats and pins.
+func (s *Server) RemoveClient(token string) (config.ClientAuth, bool) {
+	v, ok := s.ephemeral.LoadAndDelete(token)
+	if !ok {
+		return config.ClientAuth{}, false
+	}
+	ca := v.(config.ClientAuth)
+	s.sel.ForgetClient(ca.Name)
+	return ca, true
+}
+
+// Clients returns the registered (runtime) clients by token.
+func (s *Server) Clients() map[string]config.ClientAuth {
+	out := map[string]config.ClientAuth{}
+	s.ephemeral.Range(func(k, v any) bool {
+		out[k.(string)] = v.(config.ClientAuth)
+		return true
+	})
+	return out
+}
+
+// authenticate resolves the client of a request: configured tokens first,
+// then runtime-registered ones.
+func (s *Server) authenticate(st *State, r *http.Request) (config.ClientAuth, bool) {
+	if ca, ok := st.authenticate(r); ok {
+		return ca, true
+	}
+	if tok := clientToken(r); tok != "" {
+		if v, ok := s.ephemeral.Load(tok); ok {
+			return v.(config.ClientAuth), true
+		}
+	}
+	return config.ClientAuth{}, false
 }
 
 func (st *State) authenticate(r *http.Request) (config.ClientAuth, bool) {
@@ -209,7 +252,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 		return
 	}
 
-	ca, ok := st.authenticate(r)
+	ca, ok := s.authenticate(st, r)
 	if !ok {
 		s.log.Warn("rejected client", "method", r.Method, "path", r.URL.Path, "remote", r.RemoteAddr)
 		writeError(w, http.StatusUnauthorized, "authentication_error",

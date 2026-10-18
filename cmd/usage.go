@@ -4,17 +4,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/dehydr8/cproxy/internal/config"
+	"github.com/dehydr8/cproxy/internal/daemon"
 	"github.com/dehydr8/cproxy/internal/proxy"
 	"github.com/dehydr8/cproxy/internal/wrap"
 )
@@ -27,34 +31,39 @@ var (
 var usageCmd = &cobra.Command{
 	Use:   "usage [--port N] [--json]",
 	Short: "Show live usage of a running cproxy",
-	Long: `Print the live usage of a running cproxy serve instance
-(127.0.0.1:7788 by default; $CPROXY_PORT or --port) in the terminal: pool
-accounts with request counts, rate-limit state, real usage numbers from
-Anthropic's usage API (tokens with the user:profile scope; preferred) and
-the last anthropic-ratelimit-* headers cproxy observed upstream (the
-labeled fallback), and clients with their sticky pins. --json prints the
-raw dashboard JSON instead.
+	Long: `Print the live usage of the local cproxy daemon in the terminal: pool
+accounts with request counts, tokens, rate-limit state and real usage
+numbers from Anthropic's usage API, and clients with their sticky pins.
+--json prints the raw dashboard JSON instead.
 
-The instance is whatever ` + "`cproxy serve`" + ` or the claude wrapper started. A
-one-shot ` + "`cproxy run`" + ` session keeps its port and its session token to
-itself and cannot be queried.
-
-The client token is picked from the usual places and must carry the usage
-scope (tokens with no scopes may view it too): $CPROXY_AUTH_TOKEN, a
-matching $ANTHROPIC_AUTH_TOKEN, the first usage-capable token in
-$CPROXY_CLIENT_TOKENS, then credentials.json by client name. Generate a
-dashboard-only one with ` + "`cproxy token --scopes usage`" + `.`,
+The local daemon (started by the claude wrapper or ` + "`cproxy run`" + `) is asked over
+its private socket, so no port or token is needed. With --port, or when no
+daemon runs, a ` + "`cproxy serve`" + ` on 127.0.0.1:<port> is asked instead, with a
+usage-capable client token picked from the usual places ($CPROXY_AUTH_TOKEN,
+a matching $ANTHROPIC_AUTH_TOKEN, $CPROXY_CLIENT_TOKEN_*/CPROXY_CLIENT_TOKENS,
+then credentials.json); make one with ` + "`cproxy token --scopes usage`" + `.`,
 	RunE: runUsageCmd,
 }
 
 func init() {
 	usageCmd.Flags().IntVar(&usagePortFlag, "port", defaultPort(),
-		"port of the running cproxy (default $CPROXY_PORT or 7788)")
+		"ask a cproxy serve on this port instead of the local daemon")
 	usageCmd.Flags().BoolVar(&usageRawJSON, "json", false,
 		"print the raw /usage JSON instead of a table")
 }
 
 func runUsageCmd(cmd *cobra.Command, args []string) error {
+	// The local daemon answers over its private socket: no port, no token.
+	if !cmd.Flags().Changed("port") {
+		if c, st, err := daemon.Dial(); err == nil {
+			body, err := c.Usage()
+			if err != nil {
+				return err
+			}
+			return showUsage(body, "daemon "+st.Addr)
+		}
+	}
+
 	file, err := config.Load()
 	if err != nil {
 		return err
@@ -71,7 +80,7 @@ func runUsageCmd(cmd *cobra.Command, args []string) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", usagePortFlag)
 	if err := wrap.Verify(addr, token); err != nil {
 		if !listening(addr) {
-			return fmt.Errorf("no cproxy is answering on %s (is `cproxy serve` or the claude wrapper running? start one with `cproxy serve` or launch claude through the wrapper): %w", addr, err)
+			return fmt.Errorf("no cproxy daemon is running and nothing answers on %s (launch claude through the wrapper or `cproxy run`, or point --port at a `cproxy serve`): %w", addr, err)
 		}
 		return err
 	}
@@ -92,16 +101,21 @@ func runUsageCmd(cmd *cobra.Command, args []string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("cproxy on %s answered %s: %s", addr, resp.Status, errorBody(body))
 	}
+	return showUsage(body, addr)
+}
+
+// showUsage prints a /usage?format=json body raw (--json) or as tables.
+func showUsage(body []byte, where string) error {
 	if usageRawJSON {
 		os.Stdout.Write(body)
 		return nil
 	}
-
 	var snap proxy.UsageSnapshot
 	if err := json.Unmarshal(body, &snap); err != nil {
 		return err
 	}
-	return renderUsage(os.Stdout, snap, addr, time.Now())
+	color := term.IsTerminal(int(os.Stdout.Fd())) && os.Getenv("NO_COLOR") == ""
+	return renderUsage(os.Stdout, snap, where, time.Now(), color)
 }
 
 // pickUsageToken picks the client token `cproxy usage` authenticates with:
@@ -168,39 +182,201 @@ func errorBody(body []byte) string {
 	return msg
 }
 
-// renderUsage prints a snapshot as aligned tables.
-func renderUsage(out io.Writer, snap proxy.UsageSnapshot, addr string, now time.Time) error {
-	w := tabwriter.NewWriter(out, 2, 4, 2, ' ', 0)
-	fmt.Fprintf(w, "cproxy %s on %s\tupstream %s\tup %s\n",
-		snap.Version, addr, snap.Upstream, humanDur(time.Duration(snap.UptimeSeconds*float64(time.Second))))
-
-	fmt.Fprintf(w, "\naccounts\t\n")
-	fmt.Fprintf(w, "  name\tstate\treq\ttokens\t429\terr\tlast used\tusage\trate limits\n")
+// renderUsage prints a snapshot cswap-style: a header line, one block per
+// account with bar meters for its windows, then the clients. color adds
+// ANSI colors (meters green/amber/red, states) for terminals.
+func renderUsage(out io.Writer, snap proxy.UsageSnapshot, where string, now time.Time, color bool) error {
+	p := palette{on: color}
+	var b strings.Builder
+	live := int64(0)
 	for _, a := range snap.Accounts {
-		name := a.Name
-		if a.Email != "" {
-			name += " (" + a.Email + ")"
+		live += a.InFlight
+	}
+	head := fmt.Sprintf("cproxy %s · %s · up %s", snap.Version, where,
+		humanDur(time.Duration(snap.UptimeSeconds*float64(time.Second))))
+	if live > 0 {
+		head += " · " + p.green(fmt.Sprintf("%d streaming", live))
+	}
+	fmt.Fprintln(&b, p.bold(head))
+
+	for _, a := range snap.Accounts {
+		b.WriteString("\n")
+		id := p.bold(a.Name)
+		if a.Plan != "" {
+			id += " " + p.blue(a.Plan)
 		}
-		tokens, _ := proxy.TokensLabel(a.Tokens)
-		fmt.Fprintf(w, "  %s\t%s\t%d\t%s\t%d\t%d\t%s\t%s\t%s\n",
-			name, accountState(a, now), a.Requests, orDash(tokens), a.RateLimited, a.Errors,
-			agoString(a.LastUsed, now),
-			proxy.UsageAPISummary(a.UsageAPI, a.UsageAPIErr, now),
-			proxy.RateLimitsSummary(a.RateLimits, now))
+		if a.Email != "" {
+			id += "  " + p.dim(a.Email)
+		}
+		fmt.Fprintln(&b, id)
+
+		state := p.state(a, now)
+		if len(a.PinnedBy) > 0 {
+			state += p.dim(" · for " + strings.Join(a.PinnedBy, ", "))
+		}
+		fmt.Fprintln(&b, "  "+state)
+
+		meters := accountMeters(a, now)
+		for _, m := range meters {
+			fmt.Fprintf(&b, "  %-11s %s %s  %s\n", trunc(m.label, 11), p.bar(m.pct), p.tone(m.pct, fmt.Sprintf("%-6s", m.value)), p.dim(m.note))
+		}
+		if len(meters) == 0 {
+			switch {
+			case a.UsageAPIErr != "":
+				fmt.Fprintln(&b, "  "+p.dim(a.UsageAPIErr))
+			case a.RateLimits != nil:
+				fmt.Fprintln(&b, "  "+p.dim("headers: "+proxy.RateLimitsSummary(a.RateLimits, now)))
+			default:
+				fmt.Fprintln(&b, "  "+p.dim("no usage seen yet"))
+			}
+		}
+
+		stats := fmt.Sprintf("%d requests", a.Requests)
+		if tokens, _ := proxy.TokensLabel(a.Tokens); tokens != "" {
+			stats += " · " + tokens
+		}
+		if a.RateLimited > 0 {
+			stats += " · " + p.amber(fmt.Sprintf("%d 429s", a.RateLimited))
+		}
+		if a.Errors > 0 {
+			stats += " · " + p.amber(fmt.Sprintf("%d errors", a.Errors))
+		}
+		stats += " · last used " + agoString(a.LastUsed, now)
+		fmt.Fprintln(&b, "  "+p.dim(stats))
+	}
+	if len(snap.Accounts) == 0 {
+		fmt.Fprintln(&b, "\nno accounts configured")
 	}
 
-	fmt.Fprintf(w, "\nclients\t\n")
-	fmt.Fprintf(w, "  name\tpool\tpinned\treq\ttokens\tlast seen\n")
-	for _, c := range snap.Clients {
-		tokens, _ := proxy.TokensLabel(c.Tokens)
-		seen := agoString(c.LastSeen, now)
-		if c.Live > 0 {
-			seen = "streaming"
+	if len(snap.Clients) > 0 {
+		fmt.Fprintln(&b, "\n"+p.bold("clients"))
+		w := tabwriter.NewWriter(&b, 2, 4, 2, ' ', 0)
+		for _, c := range snap.Clients {
+			seen := agoString(c.LastSeen, now)
+			if c.Live > 0 {
+				seen = p.green("streaming")
+			}
+			pin := c.Pool
+			if c.Pinned != "" && c.Pinned != "—" {
+				pin += " → " + c.Pinned
+			}
+			tokens, _ := proxy.TokensLabel(c.Tokens)
+			fmt.Fprintf(w, "  %s\t%s\t%d req\t%s\t%s\n", c.Name, pin, c.Requests, orDash(tokens), seen)
 		}
-		fmt.Fprintf(w, "  %s\t%s\t%s\t%d\t%s\t%s\n",
-			c.Name, c.Pool, orDash(c.Pinned), c.Requests, orDash(tokens), seen)
+		w.Flush()
 	}
-	return w.Flush()
+	_, err := io.WriteString(out, b.String())
+	return err
+}
+
+type meterLine struct {
+	label, value, note string
+	pct                float64
+}
+
+// accountMeters lists an account's windows: from the usage API when
+// available, else the subscription windows from its last response headers.
+func accountMeters(a proxy.UsageAccount, now time.Time) []meterLine {
+	var out []meterLine
+	reset := func(t *time.Time) string {
+		if t == nil {
+			return ""
+		}
+		return "resets in " + countdown(*t, now)
+	}
+	if u := a.UsageAPI; u != nil {
+		if w := u.FiveHour; w != nil {
+			out = append(out, meterLine{"5-hour", pct(w.Pct), reset(w.ResetsAt), w.Pct})
+		}
+		if w := u.SevenDay; w != nil {
+			out = append(out, meterLine{"7-day", pct(w.Pct), reset(w.ResetsAt), w.Pct})
+		}
+		for _, sc := range u.Scoped {
+			out = append(out, meterLine{sc.Name, pct(sc.Pct), reset(sc.ResetsAt), sc.Pct})
+		}
+		if sp := u.Spend; sp != nil && sp.Limit != nil && sp.Used != nil {
+			out = append(out, meterLine{"Extra usage", pct(sp.Pct), fmt.Sprintf("%s %.2f / %.2f", sp.Currency, *sp.Used, *sp.Limit), sp.Pct})
+		}
+		return out
+	}
+	if rl := a.RateLimits; rl != nil {
+		if rl.FiveHourPct != nil {
+			out = append(out, meterLine{"5-hour", pct(*rl.FiveHourPct), strings.TrimSpace(reset(rl.FiveHourReset) + " (headers)"), *rl.FiveHourPct})
+		}
+		if rl.SevenDayPct != nil {
+			out = append(out, meterLine{"7-day", pct(*rl.SevenDayPct), strings.TrimSpace(reset(rl.SevenDayReset) + " (headers)"), *rl.SevenDayPct})
+		}
+	}
+	return out
+}
+
+func pct(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) + "%" }
+
+func countdown(t, now time.Time) string {
+	if d := t.Sub(now); d > 0 {
+		return humanDur(d)
+	}
+	return "now"
+}
+
+func trunc(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n-1]) + "…"
+	}
+	return s
+}
+
+// palette renders ANSI styles when on (a terminal without NO_COLOR).
+type palette struct{ on bool }
+
+func (p palette) wrap(code, s string) string {
+	if !p.on {
+		return s
+	}
+	return "\x1b[" + code + "m" + s + "\x1b[0m"
+}
+func (p palette) bold(s string) string  { return p.wrap("1", s) }
+func (p palette) dim(s string) string   { return p.wrap("2", s) }
+func (p palette) green(s string) string { return p.wrap("32", s) }
+func (p palette) amber(s string) string { return p.wrap("33", s) }
+func (p palette) red(s string) string   { return p.wrap("31", s) }
+func (p palette) blue(s string) string  { return p.wrap("34", s) }
+
+// tone colors s by utilization: green below 70%, amber below 90%, red above.
+func (p palette) tone(v float64, s string) string {
+	switch {
+	case v >= 90:
+		return p.red(s)
+	case v >= 70:
+		return p.amber(s)
+	default:
+		return p.green(s)
+	}
+}
+
+// bar draws a 20-cell meter.
+func (p palette) bar(v float64) string {
+	const width = 20
+	n := int(math.Round(math.Max(0, math.Min(100, v)) / 100 * width))
+	return p.tone(v, strings.Repeat("█", n)) + p.dim(strings.Repeat("░", width-n))
+}
+
+func (p palette) state(a proxy.UsageAccount, now time.Time) string {
+	st := baseState(a, now)
+	switch {
+	case a.Disabled:
+		st = p.dim("○ " + st)
+	case a.Invalid:
+		st = p.red("● " + st)
+	case strings.HasPrefix(st, "cooling"):
+		st = p.amber("● " + st)
+	default:
+		st = p.green("● available")
+	}
+	if a.InFlight > 0 && !a.Disabled && !a.Invalid {
+		st += p.green(fmt.Sprintf(" · %d streaming", a.InFlight))
+	}
+	return st
 }
 
 // accountState labels an account, with its cooldown countdown when cooling.

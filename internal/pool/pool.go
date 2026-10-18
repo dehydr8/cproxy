@@ -470,6 +470,22 @@ func (s *Selector) BeginClient(client string) (end func()) {
 	}
 }
 
+// ForgetClient drops a client's stats and sticky pins (a runtime client
+// that went away).
+func (s *Selector) ForgetClient(client string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.clientReq, client)
+	delete(s.clientLast, client)
+	delete(s.clientLive, client)
+	delete(s.clientTok, client)
+	for key := range s.sticky {
+		if strings.HasSuffix(key, "|"+client) {
+			delete(s.sticky, key)
+		}
+	}
+}
+
 // AddTokens records the tokens of one response, for its account and client.
 func (s *Selector) AddTokens(account, client string, u TokenUsage) {
 	s.mu.Lock()

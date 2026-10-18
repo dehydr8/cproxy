@@ -9,12 +9,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"time"
 
@@ -22,131 +20,22 @@ import (
 	"github.com/dehydr8/cproxy/internal/proxy"
 )
 
-// DefaultPort is the shared local port the claude wrapper and its serve
-// instance agree on (127.0.0.1:7788).
+// DefaultPort is the local port the daemon prefers for claude
+// (127.0.0.1:7788); it takes any free port when that one is busy.
 const DefaultPort = 7788
 
-// ServeOptions configures EnsureServe.
-type ServeOptions struct {
-	Port    int      // shared port; DefaultPort when 0
-	Environ []string // inherited by the spawned serve instance
-	Token   string   // client token claude will present; verified before use
-	// DashboardToken, when set, is put in the orb portal's URL so the
-	// dashboard opens without asking for a token (see InAmpOrb).
-	DashboardToken string
-}
-
-// EnsureServe makes sure a cproxy serve instance is listening on
-// 127.0.0.1:Port, spawning one when nothing is. It returns the spawned
-// process (nil when one was already listening) so callers that want to
-// tear it down can.
-//
-// The spawned serve is detached from this process and inherits Environ, so
-// environment-based credentials (CPROXY_TOKENS, CPROXY_CLIENT_TOKENS, …)
-// reach it without any service, profile, or login-shell wiring. It keeps
-// serving after claude exits; if it dies (machine reboot, orb update), the
-// next shim launch starts a fresh one.
-//
-// Before returning, the listener is verified (see Verify) to be a cproxy
-// that holds opts.Token, so the token is never handed to whatever else
-// happens to own the port, and a serve started with an older configuration
-// is reported instead of failing every request with 401.
-//
-// In an Amp orb (AMP_THREAD_ID set and the amp CLI on PATH) the usage
-// dashboard is also exposed as a portal, best-effort.
-func EnsureServe(opts ServeOptions) (*exec.Cmd, error) {
-	if opts.Port == 0 {
-		opts.Port = DefaultPort
-	}
-	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(opts.Port))
-
-	var spawned *exec.Cmd
-	if !listening(addr) {
-		self, err := os.Executable()
-		if err != nil {
-			return nil, err
-		}
-		spawned, err = spawnServe(self, addr, opts.Environ)
-		if err != nil {
-			return nil, err
-		}
-		if err := waitListening(spawned, addr, 10*time.Second); err != nil {
-			return spawned, fmt.Errorf("cproxy serve did not come up on %s (log: %s): %w", addr, ServeLogPath(), err)
-		}
-	}
-	// A running serve picks up a just-created token within its reload poll
-	// (~2s), so a serve that does not know the token yet gets a moment.
+// VerifyWithGrace is Verify, giving a daemon that does not know token yet a
+// moment to reload it (it polls its credential files every 2s).
+func VerifyWithGrace(addr, token string) error {
 	deadline := time.Now().Add(verifyGrace)
 	for {
-		err := Verify(addr, opts.Token)
-		if err == nil {
-			break
-		}
+		err := Verify(addr, token)
 		var stale *StaleServeError
-		if !errors.As(err, &stale) || time.Now().After(deadline) {
-			return spawned, err
+		if err == nil || !errors.As(err, &stale) || time.Now().After(deadline) {
+			return err
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	exposeUsagePortal(addr, opts.DashboardToken)
-	return spawned, nil
-}
-
-// spawnServe starts a detached `cproxy serve --addr addr` that inherits
-// environ and logs to ~/.cproxy/serve.log.
-func spawnServe(self, addr string, environ []string) (*exec.Cmd, error) {
-	if err := os.MkdirAll(config.Home(), 0o700); err != nil {
-		return nil, err
-	}
-	logFile, err := os.OpenFile(ServeLogPath(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("open serve log: %w", err)
-	}
-	defer logFile.Close()
-
-	cmd := exec.Command(self, "serve", "--addr", addr)
-	cmd.Env = environ
-	cmd.Stdout, cmd.Stderr = logFile, logFile
-	detach(cmd)
-	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("start cproxy serve: %w", err)
-	}
-	return cmd, nil
-}
-
-// waitListening polls addr until something accepts, the spawned serve
-// exits, or the deadline passes.
-func waitListening(cmd *exec.Cmd, addr string, d time.Duration) error {
-	exited := make(chan error, 1)
-	go func() { exited <- cmd.Wait() }()
-	deadline := time.Now().Add(d)
-	for {
-		if listening(addr) {
-			return nil
-		}
-		select {
-		case err := <-exited:
-			if err != nil {
-				return err
-			}
-			return errors.New("serve exited unexpectedly")
-		default:
-		}
-		if time.Now().After(deadline) {
-			return errors.New("timed out waiting for the port")
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-// listening reports whether anything accepts connections on addr.
-func listening(addr string) bool {
-	c, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
-	if err != nil {
-		return false
-	}
-	c.Close()
-	return true
 }
 
 // InAmpOrb reports whether the wrapper runs inside an Amp orb that can
@@ -159,11 +48,11 @@ func InAmpOrb() bool {
 	return err == nil
 }
 
-// exposeUsagePortal registers the /usage dashboard as an Amp portal when
+// ExposeUsagePortal registers the /usage dashboard as an Amp portal when
 // running inside an orb, with token (usage-only) in its URL so the page
 // opens straight away; portals are private to the thread's owner unless
 // they choose otherwise. Best-effort: outside Amp nothing happens.
-func exposeUsagePortal(addr, token string) {
+func ExposeUsagePortal(addr, token string) {
 	if !InAmpOrb() {
 		return
 	}

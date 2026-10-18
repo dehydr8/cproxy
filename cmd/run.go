@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -18,6 +19,7 @@ import (
 	"github.com/dehydr8/cproxy/internal/pool"
 	"github.com/dehydr8/cproxy/internal/proxy"
 	"github.com/dehydr8/cproxy/internal/version"
+	"github.com/dehydr8/cproxy/internal/wrap"
 )
 
 var (
@@ -25,25 +27,36 @@ var (
 	runStrategy string
 	runUpstream string
 	runPort     int
+	runIsolated bool
 )
 
 var runCmd = &cobra.Command{
 	Use:   "run [flags] [--] [command [args...]]",
-	Short: "Start a local proxy and launch a command (default: claude) through it",
-	Long: `Start a local proxy that fronts the Anthropic API, then launch COMMAND
-(default: claude) with ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN pointed
-at it. Ambient Anthropic credentials and CPROXY_* secrets are stripped from
-the child's environment, so the selected pool is the only thing it can use.
+	Short: "Launch a command (default: claude) through the local cproxy daemon",
+	Long: `Launch COMMAND (default: claude) with ANTHROPIC_BASE_URL and
+ANTHROPIC_AUTH_TOKEN pointed at the per-user cproxy daemon, starting it on
+first use. Every ` + "`cproxy run`" + ` and every wrapped claude on the machine share that
+one daemon: one set of sticky pins, cooldowns and usage, one dashboard.
+Launches drawing from the same pool share one identity (and so one sticky
+account). Ambient Anthropic credentials and CPROXY_* secrets are stripped
+from the child's environment.
 
-The child shares cproxy's process group: Ctrl+C reaches it directly and
-cproxy keeps serving until it exits, then exits with its code.
+Arguments after "--" that start with a flag (or are not a command on PATH)
+are passed to claude, so ` + "`cproxy run --pool cvp -- --resume x`" + ` works like
+cswap's run.
+
+--isolated (implied by --strategy, --upstream or --port) runs a private
+proxy for this one launch instead.
+
+The child shares cproxy's process group: Ctrl+C reaches it directly, and
+cproxy exits with its code.
 
 Examples:
 
-	cproxy run -- claude                    # default pool, default command
-	cproxy run --pool cvp -- claude --resume x
-	CPROXY_TOKENS=a:sk-…,b:sk-… cproxy run -- claude
-	cproxy run --pool cvp -- claude -p "hello"`,
+	cproxy run                               # claude, default pool
+	cproxy run --pool cvp -- --resume x      # claude --resume x on pool cvp
+	cproxy run --pool cvp -- claude -p "hello"
+	cproxy run --isolated -- claude          # a private one-off proxy`,
 	Args: cobra.ArbitraryArgs,
 	RunE: runRun,
 }
@@ -55,6 +68,8 @@ func init() {
 		"override the pool's strategy ("+pool.Strategies()+")")
 	runCmd.Flags().StringVar(&runUpstream, "upstream", "",
 		"upstream base URL (default $CPROXY_UPSTREAM or "+config.DefaultUpstream+")")
+	runCmd.Flags().BoolVar(&runIsolated, "isolated", false,
+		"run a private proxy for this launch instead of using the shared daemon")
 	runCmd.Flags().IntVar(&runPort, "port", 0,
 		"local port to listen on (default: pick a free one)")
 	// Flags after the first positional argument belong to the wrapped
@@ -65,6 +80,9 @@ func init() {
 func runRun(cmd *cobra.Command, args []string) error {
 	if _, err := pool.ParseStrategy(runStrategy); err != nil {
 		return err
+	}
+	if !runIsolated && runStrategy == "" && runUpstream == "" && !cmd.Flags().Changed("port") {
+		return runViaDaemon(cmd, args)
 	}
 	file, err := config.Load()
 	if err != nil {
@@ -129,12 +147,14 @@ func runRun(cmd *cobra.Command, args []string) error {
 		SessionToken: sessionToken,
 	}
 
-	srv := proxy.New(proxy.Options{Upstream: upstream, State: st, Log: newLogger()})
+	// The private proxy shares this process (and so the terminal) with the
+	// child: it logs to ~/.cproxy/run.log, never to the screen claude draws on.
+	log := fileLogger("run.log")
+	srv := proxy.New(proxy.Options{Upstream: upstream, State: st, Log: log})
 	srv.Selector().SetSwitchPolicy(policy)
 	httpSrv := &http.Server{Handler: srv}
 	go httpSrv.Serve(ln)
 
-	log := newLogger()
 	log.Info("cproxy started",
 		"version", version.String(),
 		"listen", baseURL,
@@ -163,20 +183,62 @@ func runRun(cmd *cobra.Command, args []string) error {
 
 // childCommand resolves the wrapped command: everything after "--" (or all
 // positional args), defaulting to claude on PATH.
+//
+// Arguments that start with a flag, or whose first word is not a command
+// on PATH, are claude's: `cproxy run -- --resume x` runs `claude --resume x`,
+// like cswap's run. claude resolves to the real binary even when the cproxy
+// shim is installed, skipping a pointless second hop.
 func childCommand(cmd *cobra.Command, args []string) ([]string, error) {
 	child := args
 	if d := cmd.ArgsLenAtDash(); d >= 0 {
 		child = args[d:]
 	}
-	if len(child) == 0 {
-		child = []string{"claude"}
+	if len(child) > 0 && child[0] != "claude" && !strings.HasPrefix(child[0], "-") {
+		if path, err := exec.LookPath(child[0]); err == nil {
+			return append([]string{path}, child[1:]...), nil
+		}
 	}
-	path, err := exec.LookPath(child[0])
+	if len(child) > 0 && child[0] == "claude" {
+		child = child[1:]
+	}
+	real, err := resolveRealClaude("")
 	if err != nil {
-		return nil, fmt.Errorf("%q not found on PATH; pass an explicit command after \"--\" (e.g. cproxy run -- claude)", child[0])
+		return nil, err
 	}
-	child[0] = path
-	return child, nil
+	return append([]string{real}, child...), nil
+}
+
+// runViaDaemon launches the child through the shared per-user daemon. All
+// launches drawing from the same pool share one identity, named
+// claude-local (or claude-local@<pool> for an explicit --pool).
+func runViaDaemon(cmd *cobra.Command, args []string) error {
+	child, err := childCommand(cmd, args)
+	if err != nil {
+		return err
+	}
+	c, st, err := wrap.EnsureDaemon(os.Environ())
+	if err != nil {
+		return err
+	}
+	name := config.LocalClientName
+	if runPool != "" {
+		name += "@" + runPool
+	}
+	token, err := c.Register(name, runPool)
+	if err != nil {
+		return fmt.Errorf("%w\nadd accounts with: cproxy accounts add NAME --pool %s", err, runPool)
+	}
+	baseURL := "http://" + st.Addr
+	fileLogger("run.log").Info("cproxy run", "version", version.String(), "proxy", baseURL,
+		"daemon", st.Version, "client", name, "command", fmt.Sprintf("%q", child))
+	code, err := launch.Run(child, launch.BuildChildEnv(os.Environ(), baseURL, token))
+	if err != nil {
+		return err
+	}
+	if code != 0 {
+		os.Exit(code)
+	}
+	return nil
 }
 
 // randomToken returns a fresh "cp_…" client token.
