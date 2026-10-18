@@ -152,6 +152,39 @@ func fetchUsageAPI(ctx context.Context, client *http.Client, upstream *url.URL, 
 type AccountProfile struct {
 	Email        string `json:"email,omitempty"`
 	Organization string `json:"organization,omitempty"`
+	Plan         string `json:"plan,omitempty"` // e.g. "Max 20x", "Team · 5x"
+}
+
+// planLabel names a subscription from the profile's organization type and
+// rate-limit tier (claude_max + default_claude_max_20x → "Max 20x").
+func planLabel(orgType, tier string) string {
+	mult := ""
+	for _, m := range []string{"20x", "5x"} {
+		if strings.HasSuffix(tier, "_"+m) {
+			mult = m
+		}
+	}
+	name := ""
+	switch orgType {
+	case "claude_max":
+		name = "Max"
+	case "claude_pro":
+		name = "Pro"
+	case "claude_team":
+		name = "Team"
+	case "claude_enterprise":
+		name = "Enterprise"
+	default:
+		return ""
+	}
+	switch {
+	case mult == "":
+		return name
+	case name == "Max":
+		return name + " " + mult
+	default:
+		return name + " · " + mult
+	}
 }
 
 // fetchProfile resolves an OAuth token to its account identity.
@@ -162,13 +195,19 @@ func fetchProfile(ctx context.Context, client *http.Client, upstream *url.URL, t
 			EmailAddress string `json:"email_address"`
 		} `json:"account"`
 		Organization struct {
-			Name string `json:"name"`
+			Name          string `json:"name"`
+			Type          string `json:"organization_type"`
+			RateLimitTier string `json:"rate_limit_tier"`
 		} `json:"organization"`
 	}
 	if err := oauthGet(ctx, client, upstream, token, profileAPIPath, &raw); err != nil {
 		return nil, err
 	}
-	p := &AccountProfile{Email: raw.Account.Email, Organization: raw.Organization.Name}
+	p := &AccountProfile{
+		Email:        raw.Account.Email,
+		Organization: raw.Organization.Name,
+		Plan:         planLabel(raw.Organization.Type, raw.Organization.RateLimitTier),
+	}
 	if p.Email == "" {
 		p.Email = raw.Account.EmailAddress
 	}

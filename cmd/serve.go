@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strings"
 	"syscall"
 	"time"
 
@@ -43,7 +44,8 @@ Claude CLIs at. Clients set:
 	ANTHROPIC_AUTH_TOKEN=<their cproxy client token>
 
 and are authenticated against client tokens from --client-tokens,
-$CPROXY_CLIENT_TOKENS or the client_tokens map in credentials.json.
+$CPROXY_CLIENT_TOKEN_<NAME>, $CPROXY_CLIENT_TOKENS or the client_tokens map
+in credentials.json.
 Each client token may optionally route to its own pool:
 
 	"client_tokens": {"alice": {"token": "cp_…", "pool": "cvp"}}
@@ -243,9 +245,9 @@ func buildServeState() (*proxy.State, *config.Runtime, error) {
 	if len(rt.ClientAuth) == 0 && !serveNoAuth {
 		return nil, nil, fmt.Errorf(
 			"serve mode requires client tokens; configure them via --client-tokens 'name:cp_…', "+
-				"$%s, or client_tokens in %s (generate one: cproxy token). "+
+				"$%s_<NAME>, or client_tokens in %s (generate one: cproxy token). "+
 				"Pass --no-auth only for localhost testing",
-			config.EnvClientTokens, config.Path())
+			strings.TrimSuffix(config.EnvClientTokenPrefix, "_"), config.Path())
 	}
 
 	// --pool beats CPROXY_POOL; either one routes every client that does

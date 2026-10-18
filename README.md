@@ -19,10 +19,14 @@ conversation is paid for once, on one subscription. Other strategies
 
 Failover:
 
-- **429** — the account cools down (until `Retry-After`, else the
-  subscription's `anthropic-ratelimit-unified-reset`, else 10 minutes) and
-  the client is retried on the next account; it returns to the pool when the
-  cooldown expires.
+- **429** — the client is retried on the next account, and the account cools
+  down according to what the 429 says:
+  - the subscription is exhausted (`anthropic-ratelimit-unified-status:
+    rejected`): until `anthropic-ratelimit-unified-reset`;
+  - any other rate limit: `Retry-After`, else 30 seconds;
+  - a bare 429 with no rate-limit headers at all: not at all. OAuth tokens
+    get that for requests Anthropic refuses to serve on them (for example
+    without Claude Code's system prompt), and the account keeps working.
 - **401** — the account is marked invalid and excluded until the token
   changes on reload.
 - Transport errors — the account is benched briefly and another is tried
@@ -157,7 +161,8 @@ orbs, CI, or anywhere you don't want a credentials file:
 | `CPROXY_POOL` | the pool to use when `--pool` is not given (default `default`) |
 | `CPROXY_TOKENS` | several default-pool accounts in one variable: `name:token,name:token` |
 | `CPROXY_POOL_TOKENS_<POOL>` | several accounts for pool `<pool>`: `cvp1:tok,cvp2:tok` |
-| `CPROXY_CLIENT_TOKENS` | serve-mode client tokens: `name:token[:scopes]`, scopes `+`-separated |
+| `CPROXY_CLIENT_TOKEN_<NAME>` | one serve-mode client token for client `<name>`: `token[:scopes]` |
+| `CPROXY_CLIENT_TOKENS` | several client tokens in one variable: `name:token[:scopes]`, scopes `+`-separated |
 | `CPROXY_UPSTREAM` | upstream base URL (default `https://api.anthropic.com`) |
 | `CPROXY_HOME` | config directory (default `~/.cproxy`) |
 
@@ -261,7 +266,8 @@ with the pool and client tokens in its environment:
 
 ```sh
 CPROXY_TOKEN_MAIN=sk-ant-oat01-… CPROXY_TOKEN_ALT=sk-ant-oat01-… \
-CPROXY_CLIENT_TOKENS=alice:cp_…,bob:cp_…,monitor:cp_…:usage \
+CPROXY_CLIENT_TOKEN_ALICE=cp_… CPROXY_CLIENT_TOKEN_BOB=cp_… \
+CPROXY_CLIENT_TOKEN_MONITOR=cp_…:usage \
   cproxy serve --addr :7788 --usage-addr 127.0.0.1:7789
 ```
 
@@ -280,7 +286,8 @@ dashboard on the app's private network only. From the repository root:
 fly apps create my-cproxy             # then set `app` in deploy/fly/fly.toml
 fly secrets set -a my-cproxy \
   CPROXY_TOKEN_MAIN=sk-ant-oat01-… CPROXY_TOKEN_ALT=sk-ant-oat01-… \
-  CPROXY_CLIENT_TOKENS=alice:cp_…,bob:cp_…,monitor:cp_…:usage
+  CPROXY_CLIENT_TOKEN_ALICE=cp_… CPROXY_CLIENT_TOKEN_BOB=cp_… \
+  CPROXY_CLIENT_TOKEN_MONITOR=cp_…:usage
 fly deploy -c deploy/fly/fly.toml --ha=false
 ```
 
@@ -290,7 +297,7 @@ token:
 ```sh
 fly proxy 7789 -a my-cproxy
 open "http://localhost:7789/usage?token=cp_…"            # browser
-CPROXY_CLIENT_TOKENS=monitor:cp_…:usage cproxy usage --port 7789   # terminal
+CPROXY_CLIENT_TOKEN_MONITOR=cp_…:usage cproxy usage --port 7789    # terminal
 ```
 
 Keep it to **one machine** (`--ha=false`, no autostop): sticky pins,
@@ -302,10 +309,11 @@ them, and a restart (deploy, `fly secrets set`) starts them fresh.
 Serve mode exposes `/usage`:
 
 - **HTML** (light and dark, refreshes every 2s, no external scripts):
-  headline tiles, then each account with its email, state, 5-hour / 7-day /
-  per-model / extra-usage meters, request and 429 counts, and each client
-  with its pool, pinned account and last activity. Accounts without usage
-  API access show the last `anthropic-ratelimit-*` headers instead, e.g.
+  headline tiles, then each account with its email and plan, state, 5-hour /
+  7-day / per-model / extra-usage meters, request and 429 counts, and each
+  client with its pool, pinned account and last activity. Accounts without
+  usage API access get their 5-hour / 7-day meters from the last response's
+  `anthropic-ratelimit-unified-*` headers, or (API keys) a summary like
   `req 38/50 · tok 31.2k/40.0k · reset tok 26s`.
 - **JSON**: `GET /usage?format=json` for scripts and alerting.
 - **Fragment**: `GET /usage?fragment=1` returns just the stats tables.
@@ -330,7 +338,8 @@ token can answer it:
    (`spend USD 25.5/500`) and per-model weekly limits (`Fable 20%`), as
    `usage_api` in the JSON. The same tokens also answer
    `GET /api/oauth/profile`, so each account shows the email it belongs to
-   (`email` / `organization` in the JSON). This needs the `user:profile` scope — which
+   and its plan (`Max 20x`, `Team · 5x`; `email` / `organization` / `plan`
+   in the JSON). This needs the `user:profile` scope — which
    `cproxy setup-token` mints by default. Tokens that cannot query it (an
    inference-only token, a revoked one) show a note like
    `usage API: 403 (token needs the user:profile scope)` instead, and back off

@@ -16,16 +16,17 @@ import (
 
 // Environment variables understood by cproxy.
 const (
-	EnvHome          = "CPROXY_HOME"          // overrides ~/.cproxy
-	EnvTokens        = "CPROXY_TOKENS"        // name:token,… → default pool
-	EnvPoolPrefix    = "CPROXY_POOL_TOKENS_"  // + POOLNAME → that pool
-	EnvClientTokens  = "CPROXY_CLIENT_TOKENS" // name:token,… serve-mode client auth
-	EnvUpstreamName  = "CPROXY_UPSTREAM"      // upstream base URL override
-	EnvAuthTokenName = "CPROXY_AUTH_TOKEN"    // client token the claude wrapper presents
-	EnvPortName      = "CPROXY_PORT"          // port of the wrapper's shared serve instance
-	EnvPoolName      = "CPROXY_POOL"          // pool used when --pool is not given
-	EnvTokenPrefix   = "CPROXY_TOKEN_"        // + NAME → one default-pool account
-	EnvPoolTokenPref = "CPROXY_POOL_TOKEN_"   // + POOL_NAME → one account in POOL
+	EnvHome              = "CPROXY_HOME"          // overrides ~/.cproxy
+	EnvTokens            = "CPROXY_TOKENS"        // name:token,… → default pool
+	EnvPoolPrefix        = "CPROXY_POOL_TOKENS_"  // + POOLNAME → that pool
+	EnvClientTokens      = "CPROXY_CLIENT_TOKENS" // name:token,… serve-mode client auth
+	EnvClientTokenPrefix = "CPROXY_CLIENT_TOKEN_" // + NAME → one client token[:scopes]
+	EnvUpstreamName      = "CPROXY_UPSTREAM"      // upstream base URL override
+	EnvAuthTokenName     = "CPROXY_AUTH_TOKEN"    // client token the claude wrapper presents
+	EnvPortName          = "CPROXY_PORT"          // port of the wrapper's shared serve instance
+	EnvPoolName          = "CPROXY_POOL"          // pool used when --pool is not given
+	EnvTokenPrefix       = "CPROXY_TOKEN_"        // + NAME → one default-pool account
+	EnvPoolTokenPref     = "CPROXY_POOL_TOKEN_"   // + POOL_NAME → one account in POOL
 )
 
 // DefaultUpstream is the Anthropic API base URL used unless overridden.
