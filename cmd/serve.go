@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 	"time"
 
@@ -121,7 +122,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	launch.NotifyHUP(hup)
 	go func() {
 		cur := rt
-		watchReloads(hup, config.Path(), credentialsPoll, func() {
+		watchReloads(hup, []string{config.Path(), config.LocalTokenPath()}, credentialsPoll, func() {
 			if next := reloadServe(srv, cur); next != nil {
 				cur = next
 			}
@@ -167,10 +168,17 @@ func stampOf(path string) fileStamp {
 	return fileStamp{fi.ModTime(), fi.Size()}
 }
 
-// watchReloads calls reload on every signal from hup and whenever path
-// changes (checked every interval). It returns when hup is closed.
-func watchReloads(hup <-chan os.Signal, path string, every time.Duration, reload func()) {
-	last := stampOf(path)
+// watchReloads calls reload on every signal from hup and whenever one of
+// paths changes (checked every interval). It returns when hup is closed.
+func watchReloads(hup <-chan os.Signal, paths []string, every time.Duration, reload func()) {
+	stamps := func() []fileStamp {
+		out := make([]fileStamp, len(paths))
+		for i, p := range paths {
+			out[i] = stampOf(p)
+		}
+		return out
+	}
+	last := stamps()
 	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
@@ -180,12 +188,12 @@ func watchReloads(hup <-chan os.Signal, path string, every time.Duration, reload
 				return
 			}
 		case <-t.C:
-			if stampOf(path) == last {
+			if slices.Equal(stamps(), last) {
 				continue
 			}
-			newLogger().Info("credentials file changed; reloading", "path", path)
+			newLogger().Info("credential files changed; reloading")
 		}
-		last = stampOf(path)
+		last = stamps()
 		reload()
 	}
 }

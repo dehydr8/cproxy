@@ -38,6 +38,10 @@ type FileConfig struct {
 	Accounts     []pool.Account             `json:"accounts,omitempty"`
 	Pools        map[string]PoolConfig      `json:"pools,omitempty"`
 	ClientTokens map[string]ClientTokenSpec `json:"client_tokens,omitempty"`
+
+	// LocalToken is the auto-generated local client token (LocalTokenPath),
+	// filled in by Load and never written back to credentials.json.
+	LocalToken string `json:"-"`
 }
 
 // PoolConfig tweaks a named pool.
@@ -146,11 +150,16 @@ func Home() string {
 // Path returns the credentials file location.
 func Path() string { return filepath.Join(Home(), "credentials.json") }
 
-// Load reads credentials.json. A missing file yields an empty config.
+// Load reads credentials.json (a missing file yields an empty config) and
+// the auto-generated local client token, if any.
 func Load() (*FileConfig, error) {
+	local, err := readLocalToken()
+	if err != nil {
+		return nil, err
+	}
 	b, err := os.ReadFile(Path())
 	if errors.Is(err, os.ErrNotExist) {
-		return &FileConfig{}, nil
+		return &FileConfig{LocalToken: local}, nil
 	}
 	if err != nil {
 		return nil, err
@@ -162,6 +171,7 @@ func Load() (*FileConfig, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", Path(), err)
 	}
+	cfg.LocalToken = local
 	return &cfg, nil
 }
 
@@ -305,6 +315,14 @@ func Build(file *FileConfig, environ []string) (*Runtime, error) {
 			}
 		}
 		rt.ClientAuth[spec.Token] = ClientAuth{Name: n, Pool: spec.Pool, Scopes: scopes}
+	}
+
+	// The auto-generated local token authenticates the claude wrapper with
+	// full access, unless the same secret is already configured explicitly.
+	if file.LocalToken != "" {
+		if _, ok := rt.ClientAuth[file.LocalToken]; !ok {
+			rt.ClientAuth[file.LocalToken] = ClientAuth{Name: LocalClientName, Scopes: slices.Clone(AllScopes)}
+		}
 	}
 
 	// Hand-edited file accounts may omit "type"; the proxy must still send

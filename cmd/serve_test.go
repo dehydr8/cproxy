@@ -44,7 +44,7 @@ func TestWatchReloadsOnFileChange(t *testing.T) {
 	hup := make(chan os.Signal)
 	done := make(chan struct{})
 	go func() {
-		watchReloads(hup, path, 5*time.Millisecond, func() { reloads.Add(1) })
+		watchReloads(hup, []string{path}, 5*time.Millisecond, func() { reloads.Add(1) })
 		close(done)
 	}()
 	waitFor := func(n int32, what string) {

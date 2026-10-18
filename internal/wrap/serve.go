@@ -71,8 +71,19 @@ func EnsureServe(opts ServeOptions) (*exec.Cmd, error) {
 			return spawned, fmt.Errorf("cproxy serve did not come up on %s (log: %s): %w", addr, ServeLogPath(), err)
 		}
 	}
-	if err := Verify(addr, opts.Token); err != nil {
-		return spawned, err
+	// A running serve picks up a just-created token within its reload poll
+	// (~2s), so a serve that does not know the token yet gets a moment.
+	deadline := time.Now().Add(verifyGrace)
+	for {
+		err := Verify(addr, opts.Token)
+		if err == nil {
+			break
+		}
+		var stale *StaleServeError
+		if !errors.As(err, &stale) || time.Now().After(deadline) {
+			return spawned, err
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 	exposeUsagePortal(addr)
 	return spawned, nil
@@ -182,8 +193,24 @@ func Verify(addr, token string) error {
 		return fmt.Errorf("something other than cproxy is listening on %s; cproxy will not send your client token to it. Free the port or pick another with %s / --port", addr, config.EnvPortName)
 	}
 	if !hmac.Equal([]byte(who.Proof), []byte(proxy.WhoamiProof(token, nonce))) {
-		return fmt.Errorf("the cproxy serve on %s (pid %d, %s) does not know this client token: it was started with a different configuration, and environment variables are only read when it starts. "+
-			"Restart it with `kill %d` (the next launch starts a fresh one), or use another %s", addr, who.PID, who.Cproxy, who.PID, config.EnvPortName)
+		return &StaleServeError{Addr: addr, PID: who.PID, Version: who.Cproxy}
 	}
 	return nil
+}
+
+// verifyGrace is how long EnsureServe waits for a running serve to reload a
+// token it does not know yet (serve polls its credential files every 2s).
+var verifyGrace = 3 * time.Second
+
+// StaleServeError reports a cproxy serve that does not know the client
+// token, i.e. one started with a different configuration.
+type StaleServeError struct {
+	Addr    string
+	PID     int
+	Version string
+}
+
+func (e *StaleServeError) Error() string {
+	return fmt.Sprintf("the cproxy serve on %s (pid %d, %s) does not know this client token: it was started with a different configuration, and environment variables are only read when it starts. "+
+		"Restart it with `kill %d` (the next launch starts a fresh one), or use another %s", e.Addr, e.PID, e.Version, e.PID, config.EnvPortName)
 }
