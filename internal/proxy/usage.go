@@ -109,14 +109,14 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
   {{if .Accounts}}
   <table>
     <thead><tr><th scope="col">Account</th><th scope="col">State</th><th scope="col" class="fill">Usage</th>
-      <th scope="col" class="num">Requests</th><th scope="col" class="num">429s</th><th scope="col" class="num">Errors</th>
-      <th scope="col">Last used</th><th scope="col">Token</th></tr></thead>
+      <th scope="col" class="num">Requests</th><th scope="col" class="num">429s</th><th scope="col" class="num col-errors">Errors</th>
+      <th scope="col" class="col-when">Last used</th><th scope="col" class="col-token">Token</th></tr></thead>
     <tbody>
     {{range .Accounts}}
     <tr data-account="{{.Name}}">
       <td><span class="identity"><span class="avatar hue-{{.Hue}}" aria-hidden="true">{{.Initials}}</span>
         <span class="identity-copy"><span class="identity-name">{{.Name}}{{if .Plan}} <span class="chip chip-plan">{{.Plan}}</span>{{end}}{{range .Pools}} <span class="chip chip-tag">{{.}}</span>{{end}}</span>
-        <span class="identity-sub">{{if .Email}}{{.Email}}{{else}}{{.Type}} token{{end}}</span></span></span></td>
+        <span class="identity-sub"{{if .Email}} title="{{.Email}}"{{end}}>{{if .Email}}{{.Email}}{{else}}{{.Type}} token{{end}}</span></span></span></td>
       <td><span class="badge{{if .Tone}} {{.Tone}}{{end}}">{{.State}}</span></td>
       <td class="fill usage">
         {{if .Meters}}<div class="meters">{{range .Meters}}
@@ -131,9 +131,9 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
       </td>
       <td class="num">{{.Requests}}</td>
       <td class="num{{if .RateLimited}} warn-fg{{end}}">{{.RateLimited}}</td>
-      <td class="num{{if .Errors}} warn-fg{{end}}">{{.Errors}}</td>
-      <td class="nowrap"{{if .LastUsedAt}} title="{{.LastUsedAt}}"{{end}}>{{.LastUsed}}</td>
-      <td><code>{{.Token}}</code></td>
+      <td class="num col-errors{{if .Errors}} warn-fg{{end}}">{{.Errors}}</td>
+      <td class="nowrap col-when"{{if .LastUsedAt}} title="{{.LastUsedAt}}"{{end}}>{{.LastUsed}}</td>
+      <td class="col-token"><code>{{.Token}}</code></td>
     </tr>
     {{end}}
     </tbody>
@@ -148,7 +148,7 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
   {{if .Clients}}
   <table>
     <thead><tr><th scope="col" class="fill">Client</th><th scope="col">Pool</th><th scope="col">Pinned account</th>
-      <th scope="col" class="num">Requests</th><th scope="col">Last seen</th></tr></thead>
+      <th scope="col" class="num">Requests</th><th scope="col" class="col-when">Last seen</th></tr></thead>
     <tbody>
     {{range .Clients}}
     <tr data-client="{{.Name}}">
@@ -156,7 +156,7 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
       <td><span class="chip chip-tag">{{.Pool}}</span></td>
       <td>{{if .Pinned}}<code>{{.Pinned}}</code>{{else}}<span class="faint">–</span>{{end}}</td>
       <td class="num">{{.Requests}}</td>
-      <td>{{if .Active}}<span class="presence presence-on">active</span>{{else}}<span class="presence">{{.LastSeen}}</span>{{end}}</td>
+      <td class="col-when">{{if .Active}}<span class="presence presence-on">active</span>{{else}}<span class="presence">{{.LastSeen}}</span>{{end}}</td>
     </tr>
     {{end}}
     </tbody>
@@ -190,18 +190,54 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
   </div>
 </main>
 <script>
-// Swap in the stats fragment every 2s. Inline on purpose: this page may
-// carry its client token in the URL, so it loads no third-party script.
+// Refresh the stats every 2s. Inline on purpose: this page may carry its
+// client token in the URL, so it loads no third-party script. The fragment
+// is patched into the page node by node rather than swapped wholesale, so
+// only changed text and attributes move: no layout jumps, table scroll
+// positions survive, and meters animate to their new widths.
 (function () {
   var el = document.getElementById("stats"), live = document.getElementById("live");
+  var last = "";
   function state(ok) {
     live.className = ok ? "presence presence-on" : "presence presence-off";
     live.textContent = ok ? "live" : "reconnecting";
   }
+  function morph(a, b) {
+    if (a.nodeType !== b.nodeType || a.nodeName !== b.nodeName) {
+      a.parentNode.replaceChild(b.cloneNode(true), a);
+      return;
+    }
+    if (a.nodeType === 3 || a.nodeType === 8) {
+      if (a.nodeValue !== b.nodeValue) a.nodeValue = b.nodeValue;
+      return;
+    }
+    if (a.nodeType !== 1) return;
+    var i, at;
+    for (i = 0; i < b.attributes.length; i++) {
+      at = b.attributes[i];
+      if (a.getAttribute(at.name) !== at.value) a.setAttribute(at.name, at.value);
+    }
+    for (i = a.attributes.length - 1; i >= 0; i--) {
+      if (!b.hasAttribute(a.attributes[i].name)) a.removeAttribute(a.attributes[i].name);
+    }
+    var bc = Array.prototype.slice.call(b.childNodes);
+    for (i = 0; i < bc.length; i++) {
+      if (i < a.childNodes.length) morph(a.childNodes[i], bc[i]);
+      else a.appendChild(bc[i].cloneNode(true));
+    }
+    while (a.childNodes.length > bc.length) a.removeChild(a.lastChild);
+  }
   setInterval(function () {
     fetch(el.dataset.src, {cache: "no-store"})
       .then(function (r) { return r.ok ? r.text() : Promise.reject(r.status); })
-      .then(function (html) { el.innerHTML = html; state(true); })
+      .then(function (html) {
+        state(true);
+        if (html === last) return;
+        last = html;
+        var next = el.cloneNode(false);
+        next.innerHTML = html;
+        morph(el, next);
+      })
       .catch(function () { state(false); });
   }, 2000);
 })();
