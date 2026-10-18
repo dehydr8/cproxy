@@ -279,10 +279,20 @@ type meterLine struct {
 func accountMeters(a proxy.UsageAccount, now time.Time) []meterLine {
 	var out []meterLine
 	reset := func(t *time.Time) string {
-		if t == nil {
+		switch {
+		case t == nil:
 			return ""
+		case !now.Before(*t):
+			return "window reset"
 		}
 		return "resets in " + countdown(*t, now)
+	}
+	// A reading from before its window rolled over: show the window empty.
+	level := func(v float64, t *time.Time) float64 {
+		if t != nil && !now.Before(*t) {
+			return 0
+		}
+		return v
 	}
 	if u := a.UsageAPI; u != nil {
 		note := func(s string) string { return s }
@@ -292,10 +302,12 @@ func accountMeters(a proxy.UsageAccount, now time.Time) []meterLine {
 			}
 		}
 		if w := u.FiveHour; w != nil {
-			out = append(out, meterLine{"5-hour", pct(w.Pct), note(reset(w.ResetsAt)), w.Pct})
+			v := level(w.Pct, w.ResetsAt)
+			out = append(out, meterLine{"5-hour", pct(v), note(reset(w.ResetsAt)), v})
 		}
 		if w := u.SevenDay; w != nil {
-			out = append(out, meterLine{"7-day", pct(w.Pct), note(reset(w.ResetsAt)), w.Pct})
+			v := level(w.Pct, w.ResetsAt)
+			out = append(out, meterLine{"7-day", pct(v), note(reset(w.ResetsAt)), v})
 		}
 		for _, sc := range u.Scoped {
 			out = append(out, meterLine{sc.Name, pct(sc.Pct), reset(sc.ResetsAt), sc.Pct})

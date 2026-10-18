@@ -698,6 +698,7 @@ func TestUsageScopes(t *testing.T) {
 }
 
 func TestUsageJSONAndRateLimits(t *testing.T) {
+	fiveReset := time.Now().Add(3 * time.Hour).Unix()
 	up := newFakeUpstream(t, func(w http.ResponseWriter, h hit) {
 		w.Header().Set("Anthropic-Ratelimit-Unified-Status", "allowed")
 		w.Header().Set("Anthropic-Ratelimit-Requests-Limit", "50")
@@ -708,9 +709,9 @@ func TestUsageJSONAndRateLimits(t *testing.T) {
 		w.Header().Set("Anthropic-Ratelimit-Tokens-Reset", "1920") // delta seconds
 		// Subscription windows, as real OAuth responses send them.
 		w.Header().Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.11")
-		w.Header().Set("Anthropic-Ratelimit-Unified-5h-Reset", "1792298400")
+		w.Header().Set("Anthropic-Ratelimit-Unified-5h-Reset", strconv.FormatInt(fiveReset, 10))
 		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Utilization", "0.07")
-		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Reset", "1792792800")
+		w.Header().Set("Anthropic-Ratelimit-Unified-7d-Reset", strconv.FormatInt(fiveReset+86400, 10))
 		w.Header().Set("Anthropic-Ratelimit-Unified-Representative-Claim", "five_hour")
 		w.Header().Set("Anthropic-Ratelimit-Unified-Overage-Status", "rejected")
 		w.Header().Set("Anthropic-Ratelimit-Unified-Overage-Disabled-Reason", "org_spend_cap_reached")
@@ -766,7 +767,7 @@ func TestUsageJSONAndRateLimits(t *testing.T) {
 		t.Fatalf("rate limits: %+v", acc.RateLimits)
 	}
 	if rl := acc.RateLimits; rl.FiveHourPct == nil || *rl.FiveHourPct != 11 || rl.FiveHourReset == nil ||
-		rl.FiveHourReset.Unix() != 1792298400 || rl.SevenDayPct == nil || *rl.SevenDayPct != 7 ||
+		rl.FiveHourReset.Unix() != fiveReset || rl.SevenDayPct == nil || *rl.SevenDayPct != 7 ||
 		rl.Claim != "five_hour" || rl.OverageReason != "org_spend_cap_reached" {
 		t.Fatalf("subscription windows: %+v", rl)
 	}

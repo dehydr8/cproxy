@@ -504,6 +504,12 @@ func tokenNum(n int64) string { return compactNum(&n) }
 // newMeter builds a utilization bar: green below 70%, amber below 90%, red
 // from there.
 func newMeter(label string, pct float64, resets *time.Time, now time.Time) meter {
+	// A reading from before its window rolled over says nothing about the
+	// new window: show it empty until a fresher reading arrives.
+	rolled := resets != nil && !now.Before(*resets)
+	if rolled {
+		pct = 0
+	}
 	m := meter{Label: label, Text: pctStr(pct), Tone: "ok"}
 	switch {
 	case pct >= 90:
@@ -512,7 +518,10 @@ func newMeter(label string, pct float64, resets *time.Time, now time.Time) meter
 		m.Tone = "warn"
 	}
 	m.Width = strconv.FormatFloat(math.Max(0, math.Min(100, pct)), 'f', 1, 64) + "%"
-	if resets != nil {
+	switch {
+	case rolled:
+		m.Reset = "window reset"
+	case resets != nil:
 		m.Reset = "resets in " + countdown(*resets, now)
 	}
 	return m
