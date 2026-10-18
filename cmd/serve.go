@@ -99,7 +99,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 
-	srv := proxy.New(proxy.Options{Upstream: upstream, State: st, Log: newLogger(), HideUsage: serveUsageAddr != ""})
+	srv := proxy.New(proxy.Options{Upstream: upstream, State: st, Log: newLogger(), HideUsage: serveUsageAddr != "", Probe: claudeUsageProbe()})
 	srv.Selector().SetSwitchPolicy(policy)
 	httpSrv := &http.Server{Handler: srv, ReadHeaderTimeout: 30 * time.Second}
 	log := newLogger()

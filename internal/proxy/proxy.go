@@ -37,6 +37,9 @@ type Options struct {
 	// HideUsage keeps the dashboard (/usage) and /_cproxy/* off this
 	// handler; serve them on a private listener with UsageHandler instead.
 	HideUsage bool
+
+	// Probe reads usage for OAuth tokens the usage API refuses; nil: none.
+	Probe UsageProbe
 }
 
 // State is the request-time configuration. Serve mode swaps it atomically
@@ -70,6 +73,7 @@ type Server struct {
 	maxBody   int64
 	started   time.Time // for the usage dashboard's uptime
 	hideUsage bool
+	probe     UsageProbe
 
 	ephemeral sync.Map // client token -> config.ClientAuth registered at runtime (cproxy run via the daemon)
 
@@ -118,6 +122,7 @@ func New(opts Options) *Server {
 		maxBody:   opts.MaxBody,
 		started:   time.Now(),
 		hideUsage: opts.HideUsage,
+		probe:     opts.Probe,
 		usage: &usagePoller{
 			entries: map[string]*usageEntry{},
 		},

@@ -343,3 +343,91 @@ func TestUsageAPISummary(t *testing.T) {
 }
 
 func ptrTime(t time.Time) *time.Time { return &t }
+
+func TestParseRateLimitEvents(t *testing.T) {
+	now := time.Now()
+	// A `claude -p --output-format stream-json --verbose` transcript; the
+	// last rate_limit_event wins.
+	transcript := `{"type":"system","subtype":"init"}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.1,"resetsAt":1792298400}}}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Hi"}]}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","unifiedWindows":{"five_hour":{"utilization":0.284,"resetsAt":1792298400},"seven_day":{"utilization":0.1,"resetsAt":1792792800}}}}
+{"type":"result","subtype":"success"}`
+	u, err := ParseRateLimitEvents(transcript, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Source != "probe" || u.FiveHour == nil || u.FiveHour.Pct != 28.4 || u.FiveHour.ResetsAt.Unix() != 1792298400 ||
+		u.SevenDay == nil || u.SevenDay.Pct != 10 {
+		t.Fatalf("parsed %+v five=%+v seven=%+v", u, u.FiveHour, u.SevenDay)
+	}
+
+	// A real event from Claude Code (other keys alongside unifiedWindows;
+	// utilization can be a bare integer 0).
+	real := `{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1792316400,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false,"unifiedWindows":{"five_hour":{"utilization":0,"resetsAt":1792316400},"seven_day":{"utilization":0.1,"resetsAt":1792792800}}},"uuid":"2ea0bee9","session_id":"50da98a8"}`
+	if u, err := ParseRateLimitEvents(real, now); err != nil || u.FiveHour == nil || u.FiveHour.Pct != 0 || u.SevenDay.Pct != 10 {
+		t.Fatalf("real event: %+v, %v", u, err)
+	}
+
+	// A revoked token never gets a rate_limit_event; say why.
+	_, err = ParseRateLimitEvents(`{"type":"system","subtype":"api_retry","error_status":401}`, now)
+	if err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("err = %v; want the HTTP status", err)
+	}
+}
+
+func TestUsageProbeForTokensWithoutProfileScope(t *testing.T) {
+	up := newFakeUpstream(t, func(w http.ResponseWriter, h hit) {
+		if strings.HasPrefix(h.path, "/api/oauth/") {
+			w.WriteHeader(http.StatusForbidden) // inference-only tokens
+			return
+		}
+		w.Header().Set("Anthropic-Ratelimit-Unified-5h-Utilization", "0.5")
+		w.WriteHeader(200)
+	})
+	var mu sync.Mutex
+	probed := map[string]int{}
+	probe := func(ctx context.Context, token string) (*UsageAPI, error) {
+		mu.Lock()
+		probed[token]++
+		mu.Unlock()
+		return &UsageAPI{FiveHour: &UsageAPIWindow{Pct: 33}, FetchedAt: time.Now(), Source: "probe"}, nil
+	}
+	u, _ := url.Parse(up.URL)
+	accts := []pool.Account{
+		{Name: "idle", Type: pool.TokenTypeOAuth, Token: "sk-ant-oat01-idle"},
+		{Name: "busy", Type: pool.TokenTypeOAuth, Token: "sk-ant-oat01-busy"},
+	}
+	clients := map[string]config.ClientAuth{"cp_alice": {Name: "alice"}}
+	srv := New(Options{Upstream: u, State: &State{Runtime: testRuntime(accts, clients)},
+		Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Probe: probe})
+	t.Cleanup(srv.Close)
+	ts := httptest.NewServer(srv)
+	t.Cleanup(ts.Close)
+
+	// busy serves a request, so its windows are fresh from the headers.
+	srv.sel.Pin(config.DefaultPoolName, "alice", "busy")
+	doReq(t, "POST", ts.URL+"/v1/messages", bearerHeaders("cp_alice"), "{}")
+
+	ctx := context.Background()
+	srv.pollUsageOnce(ctx)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if d, _ := srv.usage.snapshot("idle"); d != nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	srv.pollUsageOnce(ctx) // again at once: no second probe
+
+	mu.Lock()
+	defer mu.Unlock()
+	if probed["sk-ant-oat01-idle"] != 1 || probed["sk-ant-oat01-busy"] != 0 {
+		t.Fatalf("probes = %v; want idle once (refused by the usage API, no traffic), busy never (fresh headers)", probed)
+	}
+	frag := doReq(t, "GET", ts.URL+"/usage?fragment=1", bearerHeaders("cp_alice"), "")
+	b, _ := io.ReadAll(frag.Body)
+	if !strings.Contains(string(b), "33%") || !strings.Contains(string(b), "via a Haiku probe") {
+		t.Fatalf("dashboard does not show the probe result:\n%s", b)
+	}
+}

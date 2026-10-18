@@ -94,7 +94,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 	os.Chmod(sock, 0o600)
 
-	srv := proxy.New(proxy.Options{Upstream: upstream, State: st, Log: log})
+	srv := proxy.New(proxy.Options{Upstream: upstream, State: st, Log: log, Probe: claudeUsageProbe()})
 	srv.Selector().SetSwitchPolicy(policy)
 	data := &http.Server{Handler: srv, ReadHeaderTimeout: 30 * time.Second}
 
