@@ -21,8 +21,20 @@ var daemonStartTimeout = 10 * time.Second
 // at once and finishes its streams) and starts a fresh one. Finally it
 // hands the daemon environ's CPROXY_* configuration; the daemon reloads when
 // that differs from what it runs with, so a changed environment never needs
-// a manual restart.
+// a manual restart. An environment with no CPROXY_* configuration at all
+// (a shell without the variables) never replaces the daemon's.
 func EnsureDaemon(environ []string) (*daemon.Client, daemon.Status, error) {
+	return ensureDaemon(environ, true)
+}
+
+// ConnectDaemon is EnsureDaemon for read-only commands (usage, dashboard):
+// it starts the daemon when none runs but never reconfigures a running one,
+// so looking at usage from another shell cannot change what claude uses.
+func ConnectDaemon(environ []string) (*daemon.Client, daemon.Status, error) {
+	return ensureDaemon(environ, false)
+}
+
+func ensureDaemon(environ []string, sync bool) (*daemon.Client, daemon.Status, error) {
 	c, st, err := daemon.Dial()
 	if err == nil && daemon.Newer(version.String(), st.Version) {
 		if err := c.Shutdown(); err != nil {
@@ -38,6 +50,9 @@ func EnsureDaemon(environ []string) (*daemon.Client, daemon.Status, error) {
 		if c, st, err = waitDaemon(daemonStartTimeout); err != nil {
 			return nil, daemon.Status{}, fmt.Errorf("the cproxy daemon did not start (log: %s): %w", daemon.LogPath(), err)
 		}
+	}
+	if !sync || len(daemon.ConfigEnv(environ)) == 0 {
+		return c, st, nil
 	}
 	if _, err := c.SyncEnv(environ); err != nil {
 		return nil, st, fmt.Errorf("configure the cproxy daemon: %w", err)

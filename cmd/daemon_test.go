@@ -93,16 +93,44 @@ func TestDaemonSharedAcrossLaunches(t *testing.T) {
 	if st.PID != pids[0] {
 		t.Fatalf("a changed environment restarted the daemon (%d -> %d)", pids[0], st.PID)
 	}
-	body, err := c.Usage()
-	if err != nil {
+	accounts := func() int {
+		t.Helper()
+		body, err := c.Usage()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var snap proxy.UsageSnapshot
+		if err := json.Unmarshal(body, &snap); err != nil {
+			t.Fatal(err)
+		}
+		return len(snap.Accounts)
+	}
+	if n := accounts(); n != 2 {
+		t.Fatalf("after the env sync the daemon has %d accounts, want 2", n)
+	}
+
+	// A shell without any CPROXY_* configuration (only where to find the
+	// daemon) and a read-only command never take the accounts away.
+	var bare []string
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, "CPROXY_TOKEN_") {
+			bare = append(bare, kv)
+		}
+	}
+	if _, _, err := wrap.ConnectDaemon(bare[:len(bare):len(bare)]); err != nil {
 		t.Fatal(err)
 	}
-	var snap proxy.UsageSnapshot
-	if err := json.Unmarshal(body, &snap); err != nil {
+	var noConfig []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "CPROXY_") || strings.HasPrefix(kv, "CPROXY_HOME=") {
+			noConfig = append(noConfig, kv)
+		}
+	}
+	if _, _, err := wrap.EnsureDaemon(noConfig); err != nil {
 		t.Fatal(err)
 	}
-	if len(snap.Accounts) != 2 {
-		t.Fatalf("after the env sync the daemon has %d accounts, want 2", len(snap.Accounts))
+	if n := accounts(); n != 2 {
+		t.Fatalf("a shell without the variables left the daemon %d accounts, want 2", n)
 	}
 }
 

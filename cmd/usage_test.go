@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -62,7 +63,7 @@ func TestRunUsageCmd(t *testing.T) {
 		io.WriteString(w, cannedSnapshot(time.Now()))
 	}))
 	defer ts.Close()
-	usagePortFlag = portOf(t, ts.URL)
+	setUsagePort(t, portOf(t, ts.URL))
 	usageRawJSON = false
 
 	out, err := runUsageCmdOutput()
@@ -91,6 +92,7 @@ func TestRunUsageCmdNoCapableToken(t *testing.T) {
 	// locally instead of making a doomed request.
 	t.Setenv("CPROXY_CLIENT_TOKENS", "mon:cp_noview:proxy")
 
+	setUsagePort(t, 1) // asking a serve: a usage-capable token is needed
 	if _, err := runUsageCmdOutput(); err == nil ||
 		!strings.Contains(err.Error(), "no configured client token may view usage") {
 		t.Fatalf("err = %v; want the local no-usage-capable-token error", err)
@@ -111,7 +113,7 @@ func TestRunUsageCmdForbidden(t *testing.T) {
 		io.WriteString(w, `{"type":"error","error":{"type":"permission_error","message":"cproxy: this token may not view usage (add the \"usage\" scope)"}}`)
 	}))
 	defer ts.Close()
-	usagePortFlag = portOf(t, ts.URL)
+	setUsagePort(t, portOf(t, ts.URL))
 	usageRawJSON = false
 
 	if _, err := runUsageCmdOutput(); err == nil ||
@@ -130,6 +132,38 @@ func answerWhoami(w http.ResponseWriter, r *http.Request, token string) bool {
 	rt := &config.Runtime{ClientAuth: map[string]config.ClientAuth{token: {Name: "t"}}}
 	proxy.New(proxy.Options{Upstream: u, State: &proxy.State{Runtime: rt}}).ServeHTTP(w, r)
 	return true
+}
+
+// setUsagePort passes --port (asking a serve instead of the local daemon).
+func setUsagePort(t *testing.T, port int) {
+	t.Helper()
+	usageCmd.Flags().Set("port", strconv.Itoa(port))
+	t.Cleanup(func() { usageCmd.Flags().Lookup("port").Changed = false })
+}
+
+func TestUsageStartsTheDaemonWithoutAToken(t *testing.T) {
+	// A fresh install: pool accounts, no client token, no daemon yet.
+	env := daemonEnv(t, echoAuth)
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok && strings.HasPrefix(k, "CPROXY_") {
+			t.Setenv(k, v)
+		}
+	}
+	usageRawJSON = false
+	out, err := runUsageCmdOutput()
+	if err != nil {
+		t.Fatalf("usage on a fresh install: %v", err)
+	}
+	if !strings.Contains(out, "daemon 127.0.0.1:") || !strings.Contains(out, "a\n") && !strings.Contains(out, "a ") {
+		t.Fatalf("usage output:\n%s", out)
+	}
+}
+
+func TestUsageWithoutAccountsSaysWhatToDo(t *testing.T) {
+	t.Setenv(config.EnvHome, t.TempDir())
+	if _, err := runUsageCmdOutput(); err == nil || !strings.Contains(err.Error(), "cproxy accounts add") {
+		t.Fatalf("err = %v; want how to add an account", err)
+	}
 }
 
 func portOf(t *testing.T, raw string) int {
