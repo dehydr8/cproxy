@@ -1,6 +1,6 @@
 # release-please: cut versioned releases from conventional commits on main,
-# then attach the prebuilt linux/amd64 binary to each release (public asset,
-# also consumed by the Amp post-install script in README.md).
+# then attach prebuilt binaries (linux and darwin, amd64 and arm64) to each
+# release (public assets; linux-amd64 is also the Amp post-install script's).
 #
 # Flow: push conventional commits (feat:/fix:) to main → release-please opens/
 # updates the release PR → merge it → this workflow tags the release, builds
@@ -27,12 +27,22 @@ jobs:
         with:
           release-type: go
 
-  release-linux-amd64:
+  release-binaries:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: darwin, goarch: amd64 }
+    env:
+      PLATFORM: ${{ matrix.goos }}-${{ matrix.goarch }}
+      TAG: ${{ needs.release-please.outputs.tag_name }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -41,27 +51,29 @@ jobs:
         with:
           go-version-file: go.mod
       - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w -X github.com/dehydr8/cproxy/internal/version.Version=${{ needs.release-please.outputs.tag_name }}" -o dist/cproxy .
-          ./dist/cproxy version
+          go build -trimpath -ldflags "-s -w -X github.com/dehydr8/cproxy/internal/version.Version=${TAG}" -o dist/cproxy .
+          if [ "$PLATFORM" = linux-amd64 ]; then ./dist/cproxy version; fi
       - name: package
         run: |
-          tag="${{ needs.release-please.outputs.tag_name }}"
           cp README.md dist/
           # Versioned name for humans browsing releases; versionless name is
           # the stable URL used by the README and Amp post-install script
-          # (releases/latest/download/…).
-          for name in "cproxy-${tag}-linux-amd64" cproxy-linux-amd64; do
+          # (releases/latest/download/cproxy-<os>-<arch>.tar.gz).
+          for name in "cproxy-${TAG}-${PLATFORM}" "cproxy-${PLATFORM}"; do
             tar -czf "${name}.tar.gz" -C dist cproxy README.md
             sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
           done
       - name: upload assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.release-please.outputs.tag_name }}
         run: |
           gh release upload "$TAG" \
-            cproxy-"$TAG"-linux-amd64.tar.gz cproxy-"$TAG"-linux-amd64.tar.gz.sha256 \
-            cproxy-linux-amd64.tar.gz cproxy-linux-amd64.tar.gz.sha256 \
+            "cproxy-${TAG}-${PLATFORM}.tar.gz" "cproxy-${TAG}-${PLATFORM}.tar.gz.sha256" \
+            "cproxy-${PLATFORM}.tar.gz" "cproxy-${PLATFORM}.tar.gz.sha256" \
             --clobber
