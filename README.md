@@ -43,12 +43,13 @@ Failover:
 
 ## Install
 
-Prebuilt binaries for linux/amd64 are attached to every
-[release](https://github.com/dehydr8/cproxy/releases) — a versionless
-`cproxy-linux-amd64.tar.gz` keeps a stable latest-download URL:
+Prebuilt binaries for Linux and macOS (amd64 and arm64) are attached to
+every [release](https://github.com/dehydr8/cproxy/releases); versionless
+`cproxy-<os>-<arch>.tar.gz` names keep stable latest-download URLs:
 
 ```sh
-curl -fsSL https://github.com/dehydr8/cproxy/releases/latest/download/cproxy-linux-amd64.tar.gz \
+os=$(uname -s | tr A-Z a-z); arch=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+curl -fsSL "https://github.com/dehydr8/cproxy/releases/latest/download/cproxy-$os-$arch.tar.gz" \
   | tar xz -C /tmp
 install -m 755 /tmp/cproxy ~/.local/bin/cproxy
 ```
