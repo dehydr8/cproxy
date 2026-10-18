@@ -251,6 +251,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 		s.serveWhoami(w, r, st) // unauthenticated by design; see WhoamiPath
 		return
 	}
+	if r.URL.Path == "/api/hello" && api {
+		s.serveHello(w, r) // Claude Code's connectivity probe carries no token
+		return
+	}
 
 	ca, ok := s.authenticate(st, r)
 	if !ok {
@@ -413,6 +417,30 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 	s.log.Error("all upstream attempts failed", "client", ca.Name, "pool", pn, "err", errString(lastErr))
 	writeError(rec, http.StatusBadGateway, "api_error",
 		"cproxy: all upstream attempts failed; last error: "+errString(lastErr))
+}
+
+// serveHello answers Claude Code's connectivity probe (GET/HEAD /api/hello,
+// sent without credentials) by asking the upstream the same, also without
+// credentials, so the probe reports real reachability and no client is
+// "rejected" on every launch.
+func (s *Server) serveHello(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusMethodNotAllowed, "invalid_request_error", "cproxy: method not allowed")
+		return
+	}
+	u := *s.upstream
+	u.Path = strings.TrimSuffix(u.Path, "/") + "/api/hello"
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, u.String(), nil)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "api_error", "cproxy: "+err.Error())
+		return
+	}
+	resp, err := s.client.Do(req)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "api_error", "cproxy: upstream unreachable: "+err.Error())
+		return
+	}
+	s.copyResponse(w, resp, nil)
 }
 
 // readBody returns the request body bytes when they fit under the replay
