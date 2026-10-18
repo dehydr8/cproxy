@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -140,6 +142,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		SyncEnv: func(cfg []string) (bool, error) {
 			mu.Lock()
 			same := daemon.EnvHash(cfg) == envHash
+			changed := changedVars(daemon.ConfigEnv(env), cfg)
 			mu.Unlock()
 			if same {
 				return false, nil
@@ -150,7 +153,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			if err := reload(next); err != nil {
 				return false, err
 			}
-			log.Info("configuration updated by a client", "accounts", len(rt.Accounts))
+			// Names only: the values are secrets.
+			log.Info("configuration updated by a client", "changed", strings.Join(changed, ","))
 			return true, nil
 		},
 		Register: func(name, pool string) (string, error) {
@@ -224,6 +228,33 @@ func changedAccounts(srv *proxy.Server, old, next *config.Runtime) {
 			srv.ForgetAccount(a.Name)
 		}
 	}
+}
+
+// changedVars lists the names of variables added, removed or changed
+// between two environments.
+func changedVars(old, next []string) []string {
+	vals := func(env []string) map[string]string {
+		m := map[string]string{}
+		for _, kv := range env {
+			k, v, _ := strings.Cut(kv, "=")
+			m[k] = v
+		}
+		return m
+	}
+	o, n := vals(old), vals(next)
+	var out []string
+	for k, v := range n {
+		if ov, ok := o[k]; !ok || ov != v {
+			out = append(out, k)
+		}
+	}
+	for k := range o {
+		if _, ok := n[k]; !ok {
+			out = append(out, k)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // withoutConfigEnv drops the variables daemon.ConfigEnv would keep.

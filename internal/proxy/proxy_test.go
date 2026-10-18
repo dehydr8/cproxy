@@ -943,3 +943,27 @@ func TestStickyMovesOffANearlySpentAccount(t *testing.T) {
 		t.Fatalf("served by %v; want a once, then b", got)
 	}
 }
+
+func TestHelloProbeForwardedWithoutCredentials(t *testing.T) {
+	up := newFakeUpstream(t, func(w http.ResponseWriter, h hit) {
+		w.WriteHeader(200)
+		io.WriteString(w, "hello")
+	})
+	accts := []pool.Account{{Name: "a", Token: "tokA"}}
+	ts := newProxy(t, up.URL, testRuntime(accts, nil), "", nil)
+
+	// Claude Code probes connectivity with no token: answered from the
+	// upstream, and no account credential is attached to the probe.
+	resp := doReq(t, "HEAD", ts.URL+"/api/hello", nil, "")
+	if resp.StatusCode != 200 {
+		t.Fatalf("probe: %d", resp.StatusCode)
+	}
+	hits := up.recorded()
+	if len(hits) != 1 || hits[0].path != "/api/hello" || hits[0].auth != "" || hits[0].apiKey != "" {
+		t.Fatalf("upstream saw %+v; want one credential-less /api/hello", hits)
+	}
+	// Everything else still needs a client token.
+	if resp := doReq(t, "POST", ts.URL+"/v1/messages", nil, "{}"); resp.StatusCode != 401 {
+		t.Fatalf("unauthenticated API call: %d", resp.StatusCode)
+	}
+}
