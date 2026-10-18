@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.7.1](https://github.com/dehydr8/cproxy/compare/v1.7.0...v1.7.1) (2026-10-18)
+
+
+### Bug Fixes
+
+* `cproxy usage` starts the daemon instead of asking for a token ([95c6d1d](https://github.com/dehydr8/cproxy/commit/95c6d1dbca6d791831a9afbb3c27da3f99dfd9f5))
+
 ## [1.7.0](https://github.com/dehydr8/cproxy/compare/v1.6.0...v1.7.0) (2026-10-18)
 
 
