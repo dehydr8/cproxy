@@ -175,30 +175,43 @@ func renderUsage(out io.Writer, snap proxy.UsageSnapshot, addr string, now time.
 		snap.Version, addr, snap.Upstream, humanDur(time.Duration(snap.UptimeSeconds*float64(time.Second))))
 
 	fmt.Fprintf(w, "\naccounts\t\n")
-	fmt.Fprintf(w, "  name\tstate\treq\t429\terr\tlast used\tusage\trate limits\n")
+	fmt.Fprintf(w, "  name\tstate\treq\ttokens\t429\terr\tlast used\tusage\trate limits\n")
 	for _, a := range snap.Accounts {
 		name := a.Name
 		if a.Email != "" {
 			name += " (" + a.Email + ")"
 		}
-		fmt.Fprintf(w, "  %s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\n",
-			name, accountState(a, now), a.Requests, a.RateLimited, a.Errors,
+		tokens, _ := proxy.TokensLabel(a.Tokens)
+		fmt.Fprintf(w, "  %s\t%s\t%d\t%s\t%d\t%d\t%s\t%s\t%s\n",
+			name, accountState(a, now), a.Requests, orDash(tokens), a.RateLimited, a.Errors,
 			agoString(a.LastUsed, now),
 			proxy.UsageAPISummary(a.UsageAPI, a.UsageAPIErr, now),
 			proxy.RateLimitsSummary(a.RateLimits, now))
 	}
 
 	fmt.Fprintf(w, "\nclients\t\n")
-	fmt.Fprintf(w, "  name\tpool\tpinned\treq\tlast seen\n")
+	fmt.Fprintf(w, "  name\tpool\tpinned\treq\ttokens\tlast seen\n")
 	for _, c := range snap.Clients {
-		fmt.Fprintf(w, "  %s\t%s\t%s\t%d\t%s\n",
-			c.Name, c.Pool, orDash(c.Pinned), c.Requests, agoString(c.LastSeen, now))
+		tokens, _ := proxy.TokensLabel(c.Tokens)
+		seen := agoString(c.LastSeen, now)
+		if c.Live > 0 {
+			seen = "streaming"
+		}
+		fmt.Fprintf(w, "  %s\t%s\t%s\t%d\t%s\t%s\n",
+			c.Name, c.Pool, orDash(c.Pinned), c.Requests, orDash(tokens), seen)
 	}
 	return w.Flush()
 }
 
 // accountState labels an account, with its cooldown countdown when cooling.
 func accountState(a proxy.UsageAccount, now time.Time) string {
+	if a.InFlight > 0 && !a.Disabled && !a.Invalid {
+		return fmt.Sprintf("%s · %d streaming", baseState(a, now), a.InFlight)
+	}
+	return baseState(a, now)
+}
+
+func baseState(a proxy.UsageAccount, now time.Time) string {
 	switch {
 	case a.Disabled:
 		return "disabled"

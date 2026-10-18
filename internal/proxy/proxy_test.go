@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -819,5 +821,90 @@ func TestHideUsageSplitsListeners(t *testing.T) {
 	}
 	if got := len(up.recorded()); got != 1 {
 		t.Fatalf("upstream saw %d requests; want only the public API call", got)
+	}
+}
+
+func TestLiveRequestsAndTokens(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	up := newFakeUpstream(t, func(w http.ResponseWriter, h hit) {
+		switch h.body {
+		case "stream":
+			// A streaming reply held open mid-way, as a long answer would be.
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(200)
+			io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":"+
+				"{\"input_tokens\":10,\"cache_creation_input_tokens\":5,\"cache_read_input_tokens\":1000,\"output_tokens\":1}}}\n\n")
+			w.(http.Flusher).Flush()
+			started <- struct{}{}
+			<-release
+			io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n")
+		case "gzip":
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Content-Encoding", "gzip")
+			w.WriteHeader(200)
+			zw := gzip.NewWriter(w)
+			io.WriteString(zw, "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":1}}}\n\n"+
+				"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":7}}\n\n")
+			zw.Close()
+		default: // plain JSON
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, `{"type":"message","usage":{"input_tokens":3,"output_tokens":4}}`)
+		}
+	})
+	accts := []pool.Account{{Name: "a", Token: "tokA"}}
+	clients := map[string]config.ClientAuth{"cp_alice": {Name: "alice"}}
+	ts := newProxy(t, up.URL, testRuntime(accts, clients), "", nil)
+
+	snapshot := func() (UsageAccount, UsageClient) {
+		t.Helper()
+		resp := doReq(t, "GET", ts.URL+"/usage?format=json", aliceHeaders(), "")
+		var snap UsageSnapshot
+		if err := json.NewDecoder(resp.Body).Decode(&snap); err != nil {
+			t.Fatal(err)
+		}
+		return snap.Accounts[0], snap.Clients[0]
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := http.DefaultClient.Do(func() *http.Request {
+			r, _ := http.NewRequest("POST", ts.URL+"/v1/messages", strings.NewReader("stream"))
+			r.Header.Set("Authorization", "Bearer cp_alice")
+			return r
+		}())
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	<-started
+
+	// Mid-stream: the account and the client show the open request, and
+	// the account lists the client pinned to it.
+	acc, cli := snapshot()
+	if acc.InFlight != 1 || cli.Live != 1 || !slices.Equal(acc.PinnedBy, []string{"alice"}) {
+		t.Fatalf("mid-stream: account in_flight=%d pinned_by=%v, client live=%d; want 1, [alice], 1", acc.InFlight, acc.PinnedBy, cli.Live)
+	}
+	frag := doReq(t, "GET", ts.URL+"/usage?fragment=1", aliceHeaders(), "")
+	if b, _ := io.ReadAll(frag.Body); !strings.Contains(string(b), "1 streaming") {
+		t.Fatal("dashboard does not show the open stream")
+	}
+
+	close(release)
+	<-done
+	doReq(t, "POST", ts.URL+"/v1/messages", aliceHeaders(), "gzip")
+	doReq(t, "POST", ts.URL+"/v1/messages", aliceHeaders(), "{}")
+
+	// After: nothing open; tokens from all three replies are counted, with
+	// the stream's final (cumulative) output count, not its first.
+	acc, cli = snapshot()
+	want := pool.TokenUsage{Input: 10 + 100 + 3, Output: 42 + 7 + 4, CacheRead: 1000, CacheWrite: 5}
+	if acc.InFlight != 0 || cli.Live != 0 {
+		t.Fatalf("after: in_flight=%d live=%d, want 0", acc.InFlight, cli.Live)
+	}
+	if acc.Tokens != want || cli.Tokens != want {
+		t.Fatalf("tokens: account %+v, client %+v; want %+v", acc.Tokens, cli.Tokens, want)
 	}
 }
