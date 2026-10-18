@@ -22,13 +22,13 @@ import (
 // per-model weekly limits. Credit amounts are in cents; monthly_limit may be
 // null; resets_at may be null.
 const cannedUsageAPI = `{
-  "five_hour":  {"utilization": 42.5, "resets_at": "2026-10-18T00:00:00Z"},
-  "seven_day":  {"utilization": 12,   "resets_at": "2026-10-20T00:00:00Z"},
+  "five_hour":  {"utilization": 42.5, "resets_at": "2030-10-18T00:00:00Z"},
+  "seven_day":  {"utilization": 12,   "resets_at": "2030-10-20T00:00:00Z"},
   "extra_usage": {"is_enabled": true, "used_credits": 2550, "monthly_limit": 50000,
                   "utilization": 5.1, "currency": "USD", "resets_at": null},
   "limits": [
     {"scope": {"model": {"display_name": "Fable"}}, "percent": 20,
-     "resets_at": "2026-10-19T00:00:00Z"}
+     "resets_at": "2030-10-19T00:00:00Z"}
   ]
 }`
 
@@ -429,5 +429,29 @@ func TestUsageProbeForTokensWithoutProfileScope(t *testing.T) {
 	b, _ := io.ReadAll(frag.Body)
 	if !strings.Contains(string(b), "33%") || !strings.Contains(string(b), "via a Haiku probe") {
 		t.Fatalf("dashboard does not show the probe result:\n%s", b)
+	}
+}
+
+func TestProbeRereadsARolledOverWindow(t *testing.T) {
+	p := &usagePoller{entries: map[string]*usageEntry{}}
+	now := time.Now()
+	p.record("a", nil, &usageAPIError{status: http.StatusForbidden}, now)
+	if !p.claimProbe("a", now, time.Time{}) {
+		t.Fatal("first probe not claimed")
+	}
+	reset := now.Add(2 * time.Minute)
+	p.recordProbe("a", &UsageAPI{FiveHour: &UsageAPIWindow{Pct: 37, ResetsAt: &reset}, FetchedAt: now, Source: "probe"}, now)
+	if p.claimProbe("a", now.Add(time.Minute), time.Time{}) {
+		t.Fatal("re-probed before the window reset")
+	}
+	// A minute after the reset the old reading is stale: probe again, well
+	// before the regular 15 minutes are up.
+	if !p.claimProbe("a", reset.Add(probeAfterReset+time.Second), time.Time{}) {
+		t.Fatal("no re-probe after the window rolled over")
+	}
+	// Meanwhile the meter shows the rolled-over window empty.
+	m := newMeter("5-hour", 37, &reset, reset.Add(time.Second))
+	if m.Text != "0%" || m.Reset != "window reset" {
+		t.Fatalf("rolled-over meter = %+v", m)
 	}
 }

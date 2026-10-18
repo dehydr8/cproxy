@@ -397,11 +397,32 @@ func (p *usagePoller) claimProbe(name string, now, lastHeaders time.Time) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e := p.entries[name]
-	if e == nil || !e.forbidden || e.probing || now.Sub(e.probeAt) < probeEvery || now.Sub(lastHeaders) < probeEvery {
+	if e == nil || !e.forbidden || e.probing || now.Sub(lastHeaders) < probeEvery {
+		return false
+	}
+	// Every probeEvery, or as soon as a probed window has rolled over (a
+	// minute after its reset, so the new window is in place).
+	if now.Sub(e.probeAt) < probeEvery && !windowRolled(e.probe, now.Add(-probeAfterReset)) {
 		return false
 	}
 	e.probing = true
 	return true
+}
+
+// probeAfterReset is how long after a window's reset a probe re-reads it.
+const probeAfterReset = time.Minute
+
+// windowRolled reports whether any window in u reset before t.
+func windowRolled(u *UsageAPI, t time.Time) bool {
+	if u == nil {
+		return false
+	}
+	for _, w := range []*UsageAPIWindow{u.FiveHour, u.SevenDay} {
+		if w != nil && w.ResetsAt != nil && w.ResetsAt.Before(t) {
+			return true
+		}
+	}
+	return false
 }
 
 // recordProbe stores a probe's result; a failure keeps the previous one.
@@ -490,14 +511,16 @@ func (s *Server) markWindows(name string, data *UsageAPI) {
 func (s *Server) runProbe(name, token string) {
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
+	start := time.Now()
 	data, err := s.probe(ctx, token)
 	s.usage.recordProbe(name, data, time.Now())
+	took := time.Since(start).Round(time.Millisecond)
 	if err != nil {
-		s.log.Warn("usage probe failed", "account", name, "err", err.Error())
+		s.log.Warn("usage probe failed", "account", name, "dur", took, "err", err.Error())
 		return
 	}
 	s.markWindows(name, data)
-	s.log.Info("usage probe", "account", name)
+	s.log.Info("usage probe", "account", name, "dur", took)
 }
 
 // pollUsageLoop keeps usage warm while anyone is watching: one immediate
