@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.7.0](https://github.com/dehydr8/cproxy/compare/v1.6.0...v1.7.0) (2026-10-18)
+
+
+### Features
+
+* Haiku probe for usage of tokens without user:profile ([#21](https://github.com/dehydr8/cproxy/issues/21)) ([31ab2d4](https://github.com/dehydr8/cproxy/commit/31ab2d4954bbfd4fc2dde8b276839d242c06248f))
+
+
+### Bug Fixes
+
+* a probed window that rolled over shows empty and is re-read ([8445998](https://github.com/dehydr8/cproxy/commit/84459982cfc912dbc1969587c0f204e01b3739a1))
+
 ## [1.6.0](https://github.com/dehydr8/cproxy/compare/v1.5.0...v1.6.0) (2026-10-18)
 
 
