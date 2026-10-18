@@ -31,6 +31,9 @@ type ServeOptions struct {
 	Port    int      // shared port; DefaultPort when 0
 	Environ []string // inherited by the spawned serve instance
 	Token   string   // client token claude will present; verified before use
+	// DashboardToken, when set, is put in the orb portal's URL so the
+	// dashboard opens without asking for a token (see InAmpOrb).
+	DashboardToken string
 }
 
 // EnsureServe makes sure a cproxy serve instance is listening on
@@ -85,7 +88,7 @@ func EnsureServe(opts ServeOptions) (*exec.Cmd, error) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	exposeUsagePortal(addr)
+	exposeUsagePortal(addr, opts.DashboardToken)
 	return spawned, nil
 }
 
@@ -146,20 +149,47 @@ func listening(addr string) bool {
 	return true
 }
 
-// exposeUsagePortal registers the /usage dashboard as an Amp portal when
-// running inside an orb. Best-effort: outside Amp nothing happens.
-func exposeUsagePortal(addr string) {
+// InAmpOrb reports whether the wrapper runs inside an Amp orb that can
+// register portals (AMP_THREAD_ID set and the amp CLI on PATH).
+func InAmpOrb() bool {
 	if os.Getenv("AMP_THREAD_ID") == "" {
+		return false
+	}
+	_, err := exec.LookPath("amp")
+	return err == nil
+}
+
+// exposeUsagePortal registers the /usage dashboard as an Amp portal when
+// running inside an orb, with token (usage-only) in its URL so the page
+// opens straight away; portals are private to the thread's owner unless
+// they choose otherwise. Best-effort: outside Amp nothing happens.
+func exposeUsagePortal(addr, token string) {
+	if !InAmpOrb() {
 		return
 	}
-	amp, err := exec.LookPath("amp")
-	if err != nil {
-		return
+	amp, _ := exec.LookPath("amp")
+	target := "http://" + addr + "/usage"
+	if token != "" {
+		target += "?token=" + url.QueryEscape(token)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, amp, "orb", "portal", "http://"+addr+"/usage", "--title", "cproxy usage")
+	cmd := exec.CommandContext(ctx, amp, "orb", "portal", target, "--name", "cproxy-usage",
+		"--title", "cproxy usage", "--description", "Live pool usage: accounts, limits and clients")
+	cmd.Dir = portalDir()
 	_ = cmd.Run()
+}
+
+// portalDir is where `amp orb portal` runs, and so where it writes the
+// portal manifest (.amp/portals/): the orb's workspace, which Amp reads and
+// git-excludes, rather than whatever directory claude was launched in.
+func portalDir() string {
+	if d := os.Getenv("AMP_WORKING_DIRECTORY"); d != "" {
+		if fi, err := os.Stat(d); err == nil && fi.IsDir() {
+			return d
+		}
+	}
+	return config.Home()
 }
 
 // Verify checks that the listener on addr is a cproxy holding token, without

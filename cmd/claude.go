@@ -118,7 +118,15 @@ func runClaude(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("a client token is configured but no pool accounts are; add accounts with `cproxy accounts add NAME` or set CPROXY_TOKENS (or run claude per-invocation with `cproxy run -- claude`)")
 	}
 
-	if _, err := wrap.EnsureServe(wrap.ServeOptions{Port: claudePort, Environ: os.Environ(), Token: token}); err != nil {
+	// In an orb the dashboard becomes a portal; give its URL a token that
+	// can only view usage. Created before the serve starts so it knows it.
+	dashboard := ""
+	if wrap.InAmpOrb() {
+		if dashboard, err = config.EnsureDashboardToken(); err != nil {
+			return fmt.Errorf("create the dashboard token: %w", err)
+		}
+	}
+	if _, err := wrap.EnsureServe(wrap.ServeOptions{Port: claudePort, Environ: os.Environ(), Token: token, DashboardToken: dashboard}); err != nil {
 		return err
 	}
 

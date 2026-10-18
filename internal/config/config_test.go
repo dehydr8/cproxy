@@ -540,11 +540,26 @@ func TestLocalToken(t *testing.T) {
 	if !ok || ca.Name != LocalClientName || !ca.HasScope(ScopeProxy) || !ca.HasScope(ScopeUsage) {
 		t.Fatalf("local client = %+v (%v)", ca, ok)
 	}
+	// The dashboard token may only look.
+	dash, err := EnsureDashboardToken()
+	if err != nil || dash == toks[0] {
+		t.Fatalf("dashboard token %q (%v); want its own token", dash, err)
+	}
+	if file, err = Load(); err != nil {
+		t.Fatal(err)
+	}
+	if rt, err = Build(file, nil); err != nil {
+		t.Fatal(err)
+	}
+	if d := rt.ClientAuth[dash]; d.Name != DashboardClientName || d.HasScope(ScopeProxy) || !d.HasScope(ScopeUsage) {
+		t.Fatalf("dashboard client = %+v; want usage-only", d)
+	}
+
 	file.Accounts = []pool.Account{{Name: "a", Token: "sk-ant-oat01-a"}}
 	if err := Save(file); err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(Path()); strings.Contains(string(b), toks[0]) {
-		t.Fatalf("local token leaked into credentials.json:\n%s", b)
+	if b, _ := os.ReadFile(Path()); strings.Contains(string(b), toks[0]) || strings.Contains(string(b), dash) {
+		t.Fatalf("local tokens leaked into credentials.json:\n%s", b)
 	}
 }
