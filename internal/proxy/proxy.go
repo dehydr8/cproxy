@@ -239,6 +239,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 		return
 	}
 	s.sel.MarkClientAttempt(ca.Name)
+	defer s.sel.BeginClient(ca.Name)()
 
 	body, replay, err := s.readBody(r)
 	if err != nil {
@@ -264,8 +265,21 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 	rec := &recorder{ResponseWriter: w, status: http.StatusOK}
 	var held *heldResponse
 	var lastErr error
+	// Each attempt counts as in flight on its account until it is done; the
+	// deferred sweep covers every exit (the end funcs are idempotent).
+	var ends []func()
+	defer func() {
+		for _, end := range ends {
+			end()
+		}
+	}()
 	for _, acct := range ranked {
+		end := s.sel.Begin(acct.Name)
+		ends = append(ends, end)
 		resp, err := s.forward(r, body, replay, acct)
+		if err != nil {
+			end()
+		}
 		if err != nil {
 			if r.Context().Err() != nil {
 				// The client went away (e.g. interrupted in Claude); that says
@@ -294,11 +308,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 			s.sel.MarkInvalid(acct.Name)
 			s.log.Warn("upstream rejected token", "account", acct.Name, "status", resp.StatusCode)
 			if !replay {
-				s.copyResponse(rec, resp)
+				s.copyResponse(rec, resp, nil)
 				s.logDone(r, rec, ca, pn, acct.Name, start)
 				return
 			}
 			drainClose(resp)
+			end()
 			continue
 		}
 		if resp.StatusCode == http.StatusTooManyRequests && !isRateLimit(resp.Header) {
@@ -307,11 +322,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 			s.log.Info("upstream refused the request with a bare 429; not benching the account",
 				"account", acct.Name, "can_retry", replay)
 			if !replay {
-				s.copyResponse(rec, resp)
+				s.copyResponse(rec, resp, nil)
 				s.logDone(r, rec, ca, pn, acct.Name, start)
 				return
 			}
 			held = captureHeld(resp)
+			end()
 			continue
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
@@ -320,11 +336,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 			s.log.Warn("account rate limited", "account", acct.Name,
 				"cooldown", until.Sub(time.Now()).Round(time.Second), "can_retry", replay)
 			if !replay {
-				s.copyResponse(rec, resp)
+				s.copyResponse(rec, resp, nil)
 				s.logDone(r, rec, ca, pn, acct.Name, start)
 				return
 			}
 			held = captureHeld(resp)
+			end()
 			continue
 		}
 
@@ -334,7 +351,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 			// conversation instead of remapping it again next request.
 			s.sel.Pin(pn, ca.Name, acct.Name)
 		}
-		s.copyResponse(rec, resp)
+		var onUsage func(pool.TokenUsage)
+		if strings.HasSuffix(r.URL.Path, "/v1/messages") {
+			name, client := acct.Name, ca.Name
+			onUsage = func(u pool.TokenUsage) { s.sel.AddTokens(name, client, u) }
+		}
+		s.copyResponse(rec, resp, onUsage)
 		s.logDone(r, rec, ca, pn, acct.Name, start)
 		return
 	}
@@ -422,7 +444,8 @@ func copyHeaders(dst, src http.Header) {
 
 // copyResponse streams the upstream response through, flushing per chunk so
 // SSE events reach the client promptly.
-func (s *Server) copyResponse(w http.ResponseWriter, resp *http.Response) {
+// onUsage, when set, receives the token usage found in a 200 response.
+func (s *Server) copyResponse(w http.ResponseWriter, resp *http.Response, onUsage func(pool.TokenUsage)) {
 	defer resp.Body.Close()
 	dst := w.Header()
 	for k, vals := range resp.Header {
@@ -434,7 +457,13 @@ func (s *Server) copyResponse(w http.ResponseWriter, resp *http.Response) {
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	flushCopy(w, resp.Body)
+	var body io.Reader = resp.Body
+	finish := func() {}
+	if onUsage != nil && resp.StatusCode == http.StatusOK {
+		body, finish = tapUsage(resp, onUsage)
+	}
+	flushCopy(w, body)
+	finish()
 }
 
 func flushCopy(w io.Writer, body io.Reader) {

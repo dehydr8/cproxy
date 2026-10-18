@@ -205,7 +205,7 @@ func TestUsageAPIPollerPreferredOverHeaders(t *testing.T) {
 	// The dashboard renders the real numbers.
 	frag := doReq(t, "GET", ts.URL+"/usage?fragment=1", bearerHeaders("cp_alice"), "")
 	b, _ := io.ReadAll(frag.Body)
-	for _, want := range []string{"42.5%", "12%", "$25.50 / $500.00", "Fable", "20%", "main@example.com", "Max 20x"} {
+	for _, want := range []string{"42.5%", "12%", "$25.50 / $500", "Fable", "20%", "main@example.com", "Max 20x"} {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("fragment missing %q:\n%s", want, b)
 		}

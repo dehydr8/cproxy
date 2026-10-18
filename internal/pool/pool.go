@@ -108,9 +108,32 @@ type Selector struct {
 	clientReq   map[string]int64     // client -> accepted requests
 	clientLast  map[string]time.Time // client -> last accepted request
 	rateLimits  map[string]*RateLimitInfo
-	sticky      map[string]string    // pool|client -> account name
-	cooldown    map[string]time.Time // account -> rate-limited until
-	invalid     map[string]bool      // account -> token rejected upstream (401)
+	sticky      map[string]string     // pool|client -> account name
+	cooldown    map[string]time.Time  // account -> rate-limited until
+	invalid     map[string]bool       // account -> token rejected upstream (401)
+	inFlight    map[string]int64      // account -> upstream requests open right now
+	clientLive  map[string]int64      // client -> requests open right now
+	tokens      map[string]TokenUsage // account -> tokens served
+	clientTok   map[string]TokenUsage // client -> tokens used
+}
+
+// TokenUsage counts tokens as Anthropic reports them in responses.
+type TokenUsage struct {
+	Input      int64 `json:"input"` // uncached input
+	Output     int64 `json:"output"`
+	CacheRead  int64 `json:"cache_read"`  // input served from the prompt cache
+	CacheWrite int64 `json:"cache_write"` // input written to the prompt cache
+}
+
+// TotalInput is every input token, cached or not.
+func (u TokenUsage) TotalInput() int64 { return u.Input + u.CacheRead + u.CacheWrite }
+
+// IsZero reports whether nothing was counted.
+func (u TokenUsage) IsZero() bool { return u == TokenUsage{} }
+
+// Add sums two usages.
+func (u TokenUsage) Add(o TokenUsage) TokenUsage {
+	return TokenUsage{u.Input + o.Input, u.Output + o.Output, u.CacheRead + o.CacheRead, u.CacheWrite + o.CacheWrite}
 }
 
 // NewSelector returns an empty selector.
@@ -128,6 +151,10 @@ func NewSelector() *Selector {
 		sticky:      map[string]string{},
 		cooldown:    map[string]time.Time{},
 		invalid:     map[string]bool{},
+		inFlight:    map[string]int64{},
+		clientLive:  map[string]int64{},
+		tokens:      map[string]TokenUsage{},
+		clientTok:   map[string]TokenUsage{},
 	}
 }
 
@@ -253,6 +280,46 @@ func (s *Selector) MarkInvalid(name string) {
 	s.rejected[name]++
 }
 
+// Begin counts an upstream request open on an account until the returned
+// func is called (once the response has been streamed to the client or the
+// attempt failed). Calling it more than once is harmless.
+func (s *Selector) Begin(name string) (end func()) {
+	s.mu.Lock()
+	s.inFlight[name]++
+	s.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.inFlight[name]--
+			s.mu.Unlock()
+		})
+	}
+}
+
+// BeginClient counts a client request open until the returned func is called.
+func (s *Selector) BeginClient(client string) (end func()) {
+	s.mu.Lock()
+	s.clientLive[client]++
+	s.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			s.clientLive[client]--
+			s.mu.Unlock()
+		})
+	}
+}
+
+// AddTokens records the tokens of one response, for its account and client.
+func (s *Selector) AddTokens(account, client string, u TokenUsage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tokens[account] = s.tokens[account].Add(u)
+	s.clientTok[client] = s.clientTok[client].Add(u)
+}
+
 // MarkClientAttempt records that a client request was accepted (after auth
 // and pool routing, regardless of upstream outcome).
 func (s *Selector) MarkClientAttempt(client string) {
@@ -271,6 +338,8 @@ type AccountStats struct {
 	LastUsed     time.Time
 	CoolingUntil time.Time
 	Invalid      bool
+	InFlight     int64 // upstream requests open right now
+	Tokens       TokenUsage
 	RateLimits   *RateLimitInfo // last anthropic-ratelimit-* headers seen
 }
 
@@ -278,6 +347,8 @@ type AccountStats struct {
 type ClientStats struct {
 	Requests int64
 	LastSeen time.Time
+	Live     int64 // requests open right now
+	Tokens   TokenUsage
 }
 
 // RateLimitInfo is the last rate-limit snapshot seen in an account's
@@ -327,6 +398,8 @@ func (s *Selector) StatsSnapshot(names []string) map[string]AccountStats {
 			LastUsed:     s.lastUsed[n],
 			CoolingUntil: s.cooldown[n],
 			Invalid:      s.invalid[n],
+			InFlight:     s.inFlight[n],
+			Tokens:       s.tokens[n],
 			RateLimits:   s.rateLimits[n],
 		}
 	}
@@ -340,7 +413,7 @@ func (s *Selector) ClientStatsSnapshot() map[string]ClientStats {
 	defer s.mu.Unlock()
 	out := make(map[string]ClientStats, len(s.clientReq))
 	for c := range s.clientReq {
-		out[c] = ClientStats{Requests: s.clientReq[c], LastSeen: s.clientLast[c]}
+		out[c] = ClientStats{Requests: s.clientReq[c], LastSeen: s.clientLast[c], Live: s.clientLive[c], Tokens: s.clientTok[c]}
 	}
 	return out
 }

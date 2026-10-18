@@ -45,6 +45,11 @@ type accountRow struct {
 	HeaderNote  string // fallback: last anthropic-ratelimit-* headers
 	LastUsed    string
 	LastUsedAt  string // RFC3339, for the tooltip
+	InFlight    int64  // requests streaming through it right now
+	PinnedBy    string // clients pinned to it, e.g. "amp-thread-1, osama +2"
+	PinnedAll   string // every pinned client, for the tooltip
+	Tokens      string // "1.2M in · 34k out"
+	TokensTitle string // cache breakdown
 }
 
 // meter is one utilization bar (5h, 7d, a per-model limit).
@@ -64,7 +69,9 @@ type clientRow struct {
 	Pinned   string
 	Requests int64
 	LastSeen string
-	Active   bool // seen within the last two minutes
+	Active   bool  // seen within the last two minutes
+	Live     int64 // requests open right now
+	Tokens   string
 }
 
 type usageData struct {
@@ -79,6 +86,8 @@ type usageData struct {
 	Available, Cooling, Unusable  int
 	Requests, RateLimited, Errors int64
 	ActiveClients                 int
+	InFlight                      int64
+	TokensIn, TokensOut           string
 }
 
 // usageCSS styles the dashboard; it is inlined so the page needs no other
@@ -94,7 +103,9 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
     <div class="value{{if and .Accounts (eq .Available 0)}} value-danger{{else if .Available}} value-ok{{end}}">{{.Available}}<span class="of">/{{len .Accounts}}</span></div>
     <div class="hint">{{if .Cooling}}{{.Cooling}} cooling down{{else if .Unusable}}{{.Unusable}} unusable{{else}}none cooling down{{end}}</div></div>
   <div class="card tile"><div class="label">Requests served</div>
-    <div class="value">{{.Requests}}</div><div class="hint">since start</div></div>
+    <div class="value">{{.Requests}}</div><div class="hint">{{if .InFlight}}<span class="presence presence-live">{{.InFlight}} streaming now</span>{{else}}since start{{end}}</div></div>
+  <div class="card tile"><div class="label">Tokens</div>
+    <div class="value">{{.TokensIn}}</div><div class="hint">in · {{.TokensOut}} out</div></div>
   <div class="card tile"><div class="label">Rate limited</div>
     <div class="value{{if .RateLimited}} value-warn{{end}}">{{.RateLimited}}</div><div class="hint">429s failed over</div></div>
   <div class="card tile"><div class="label">Upstream errors</div>
@@ -117,7 +128,9 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
       <td><span class="identity"><span class="avatar hue-{{.Hue}}" aria-hidden="true">{{.Initials}}</span>
         <span class="identity-copy"><span class="identity-name">{{.Name}}{{if .Plan}} <span class="chip chip-plan">{{.Plan}}</span>{{end}}{{range .Pools}} <span class="chip chip-tag">{{.}}</span>{{end}}</span>
         <span class="identity-sub"{{if .Email}} title="{{.Email}}"{{end}}>{{if .Email}}{{.Email}}{{else}}{{.Type}} token{{end}}</span></span></span></td>
-      <td><span class="badge{{if .Tone}} {{.Tone}}{{end}}">{{.State}}</span></td>
+      <td><span class="badge{{if .Tone}} {{.Tone}}{{end}}">{{.State}}</span>
+        {{if .InFlight}}<div class="state-sub"><span class="presence presence-live">{{.InFlight}} streaming</span></div>{{end}}
+        {{if .PinnedBy}}<div class="state-sub faint" title="pinned: {{.PinnedAll}}">for {{.PinnedBy}}</div>{{end}}</td>
       <td class="fill usage">
         {{if .Meters}}<div class="meters">{{range .Meters}}
           <div class="meter"><div class="meter-top"><span>{{.Label}}</span><span class="meter-value {{.Tone}}">{{.Text}}</span></div>
@@ -129,7 +142,7 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
         {{if .HeaderNote}}<div class="note">from response headers{{if not .Meters}}:{{end}} {{.HeaderNote}}</div>{{end}}
         {{if not (or .Meters .Spend .UsageNote .HeaderNote)}}<span class="faint">no usage seen yet</span>{{end}}
       </td>
-      <td class="num">{{.Requests}}</td>
+      <td class="num">{{.Requests}}{{if .Tokens}}<div class="sub" title="{{.TokensTitle}}">{{.Tokens}}</div>{{end}}</td>
       <td class="num{{if .RateLimited}} warn-fg{{end}}">{{.RateLimited}}</td>
       <td class="num col-errors{{if .Errors}} warn-fg{{end}}">{{.Errors}}</td>
       <td class="nowrap col-when"{{if .LastUsedAt}} title="{{.LastUsedAt}}"{{end}}>{{.LastUsed}}</td>
@@ -148,7 +161,7 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
   {{if .Clients}}
   <table>
     <thead><tr><th scope="col" class="fill">Client</th><th scope="col">Pool</th><th scope="col">Pinned account</th>
-      <th scope="col" class="num">Requests</th><th scope="col" class="col-when">Last seen</th></tr></thead>
+      <th scope="col" class="num">Requests</th><th scope="col" class="num">Tokens</th><th scope="col" class="col-when">Last seen</th></tr></thead>
     <tbody>
     {{range .Clients}}
     <tr data-client="{{.Name}}">
@@ -156,7 +169,8 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
       <td><span class="chip chip-tag">{{.Pool}}</span></td>
       <td>{{if .Pinned}}<code>{{.Pinned}}</code>{{else}}<span class="faint">–</span>{{end}}</td>
       <td class="num">{{.Requests}}</td>
-      <td class="col-when">{{if .Active}}<span class="presence presence-on">active</span>{{else}}<span class="presence">{{.LastSeen}}</span>{{end}}</td>
+      <td class="num nowrap">{{if .Tokens}}{{.Tokens}}{{else}}<span class="faint">–</span>{{end}}</td>
+      <td class="col-when">{{if .Live}}<span class="presence presence-live">streaming</span>{{else if .Active}}<span class="presence presence-on">active</span>{{else}}<span class="presence">{{.LastSeen}}</span>{{end}}</td>
     </tr>
     {{end}}
     </tbody>
@@ -295,6 +309,15 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 	sticky := s.sel.StickySnapshot()
 	clientStats := s.sel.ClientStatsSnapshot()
 
+	// account -> clients pinned to it (pool|client -> account), sorted.
+	pinnedTo := map[string][]string{}
+	for key, acct := range sticky {
+		if _, client, ok := strings.Cut(key, "|"); ok && client != config.DashboardClientName {
+			pinnedTo[acct] = append(pinnedTo[acct], client)
+		}
+	}
+	var totalTok pool.TokenUsage
+
 	for _, a := range rt.Accounts {
 		stt := stats[a.Name]
 		apiData, apiErr := s.usage.snapshot(a.Name)
@@ -312,6 +335,11 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 		if !stt.LastUsed.IsZero() {
 			row.LastUsedAt = stt.LastUsed.Format(time.RFC3339)
 		}
+		row.InFlight = stt.InFlight
+		data.InFlight += stt.InFlight
+		row.PinnedBy, row.PinnedAll = pinnedSummary(pinnedTo[a.Name])
+		row.Tokens, row.TokensTitle = TokensLabel(stt.Tokens)
+		totalTok = totalTok.Add(stt.Tokens)
 		if prof := s.usage.profile(a.Name); prof != nil {
 			row.Email, row.Org, row.Plan = prof.Email, prof.Organization, prof.Plan
 		}
@@ -373,6 +401,7 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 		data.Accounts = append(data.Accounts, row)
 	}
 	slices.SortFunc(data.Accounts, func(a, b accountRow) int { return strings.Compare(a.Name, b.Name) })
+	data.TokensIn, data.TokensOut = tokenNum(totalTok.TotalInput()), tokenNum(totalTok.Output)
 
 	// Configured clients, plus identities seen without one (run mode's
 	// "local" session, --no-auth's "anonymous").
@@ -392,7 +421,9 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 			Requests: cs.Requests,
 			LastSeen: ago(cs.LastSeen),
 			Active:   !cs.LastSeen.IsZero() && now.Sub(cs.LastSeen) < 2*time.Minute,
+			Live:     cs.Live,
 		}
+		row.Tokens, _ = TokensLabel(cs.Tokens)
 		row.Initials, row.Hue = avatarFor(ca.Name, "")
 		if row.Active {
 			data.ActiveClients++
@@ -409,6 +440,34 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 
 	return data
 }
+
+// pinnedSummary renders the clients pinned to an account: up to two names
+// and a count, plus the full list.
+func pinnedSummary(clients []string) (short, all string) {
+	if len(clients) == 0 {
+		return "", ""
+	}
+	slices.Sort(clients)
+	all = strings.Join(clients, ", ")
+	if len(clients) <= 2 {
+		return all, all
+	}
+	return strings.Join(clients[:2], ", ") + " +" + strconv.Itoa(len(clients)-2), all
+}
+
+// TokensLabel renders token usage as "1.2M in · 34k out", with the cache
+// breakdown for a tooltip; "" when nothing was counted.
+func TokensLabel(u pool.TokenUsage) (label, title string) {
+	if u.IsZero() {
+		return "", ""
+	}
+	label = tokenNum(u.TotalInput()) + " in · " + tokenNum(u.Output) + " out"
+	title = tokenNum(u.Input) + " uncached + " + tokenNum(u.CacheRead) + " cache read + " +
+		tokenNum(u.CacheWrite) + " cache write in, " + tokenNum(u.Output) + " out"
+	return label, title
+}
+
+func tokenNum(n int64) string { return compactNum(&n) }
 
 // newMeter builds a utilization bar: green below 70%, amber below 90%, red
 // from there.
@@ -433,6 +492,7 @@ func money(currency string, v *float64) string {
 		return "–"
 	}
 	n := strconv.FormatFloat(*v, 'f', 2, 64)
+	n = strings.TrimSuffix(n, ".00") // $50, not $50.00
 	switch currency {
 	case "", "USD":
 		return "$" + n
@@ -504,14 +564,19 @@ type UsageAccount struct {
 	RateLimits   *pool.RateLimitInfo `json:"rate_limits,omitempty"`     // fallback: inferred from headers
 	Invalid      bool                `json:"invalid,omitempty"`
 	Disabled     bool                `json:"disabled,omitempty"`
+	InFlight     int64               `json:"in_flight"`           // requests streaming right now
+	PinnedBy     []string            `json:"pinned_by,omitempty"` // clients pinned to it
+	Tokens       pool.TokenUsage     `json:"tokens"`
 }
 
 type UsageClient struct {
-	Name     string     `json:"name"`
-	Pool     string     `json:"pool"`
-	Pinned   string     `json:"pinned"`
-	Requests int64      `json:"requests"`
-	LastSeen *time.Time `json:"last_seen,omitempty"`
+	Name     string          `json:"name"`
+	Pool     string          `json:"pool"`
+	Pinned   string          `json:"pinned"`
+	Requests int64           `json:"requests"`
+	LastSeen *time.Time      `json:"last_seen,omitempty"`
+	Live     int64           `json:"live"` // requests open right now
+	Tokens   pool.TokenUsage `json:"tokens"`
 }
 
 func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
@@ -537,6 +602,12 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 	}
 	stats := s.sel.StatsSnapshot(names)
 	sticky := s.sel.StickySnapshot()
+	pinnedTo := map[string][]string{}
+	for key, acct := range sticky {
+		if _, client, ok := strings.Cut(key, "|"); ok && client != config.DashboardClientName {
+			pinnedTo[acct] = append(pinnedTo[acct], client)
+		}
+	}
 	clientStats := s.sel.ClientStatsSnapshot()
 
 	for _, a := range accounts {
@@ -570,6 +641,8 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 			RateLimits:  stt.RateLimits,
 			Invalid:     stt.Invalid,
 			Disabled:    a.Disabled,
+			InFlight:    stt.InFlight,
+			Tokens:      stt.Tokens,
 		}
 		if prof := s.usage.profile(a.Name); prof != nil {
 			row.Email, row.Organization, row.Plan = prof.Email, prof.Organization, prof.Plan
@@ -581,6 +654,10 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 		if stt.CoolingUntil.After(now) {
 			t := stt.CoolingUntil
 			row.CoolingUntil = &t
+		}
+		if p := pinnedTo[a.Name]; len(p) > 0 {
+			slices.Sort(p)
+			row.PinnedBy = p
 		}
 		out.Accounts = append(out.Accounts, row)
 	}
@@ -601,6 +678,7 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 			t := cs.LastSeen
 			row.LastSeen = &t
 		}
+		row.Live, row.Tokens = clientStats[cca.Name].Live, clientStats[cca.Name].Tokens
 		out.Clients = append(out.Clients, row)
 	}
 	slices.SortFunc(out.Clients, func(a, b UsageClient) int { return strings.Compare(a.Name, b.Name) })
