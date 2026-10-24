@@ -24,6 +24,7 @@ import (
 	"github.com/dehydr8/cproxy/internal/launch"
 	"github.com/dehydr8/cproxy/internal/proxy"
 	"github.com/dehydr8/cproxy/internal/version"
+	"github.com/dehydr8/cproxy/internal/wrap"
 )
 
 // drainTimeout bounds how long a daemon handing over keeps finishing the
@@ -31,8 +32,8 @@ import (
 const drainTimeout = 30 * time.Minute
 
 var daemonCmd = &cobra.Command{
-	Use:   "daemon",
-	Short: "Run the per-user local daemon (started automatically)",
+	Use:   "daemon [status|start|stop|restart|logs]",
+	Short: "Run or control the per-user local daemon (started automatically)",
 	Long: `Run the local cproxy daemon in the foreground. You normally never start it
 yourself: ` + "`cproxy claude`" + ` (the installed shim) and ` + "`cproxy run`" + ` start it on
 first use and every later launch shares it.
@@ -41,7 +42,15 @@ There is one daemon per user, guaranteed by a lock in ~/.cproxy. Claude talks
 to it on 127.0.0.1 ($CPROXY_PORT, else 7788, else any free port); cproxy
 commands talk to it over the private socket ~/.cproxy/cproxy.sock to read its
 status and usage, hand it their CPROXY_* configuration (it reloads when that
-changed), and hand over to a newer cproxy without dropping streams.`,
+changed), and hand over to a newer cproxy without dropping streams.
+
+Control it with:
+
+	cproxy daemon status     # running? version, pid, address, streams, log
+	cproxy daemon start      # start it in the background
+	cproxy daemon stop       # stop listening; open streams finish first
+	cproxy daemon restart    # move to the installed cproxy, keeping its config
+	cproxy daemon logs -f    # its log (~/.cproxy/daemon.log)`,
 	Args: cobra.NoArgs,
 	RunE: runDaemon,
 }
@@ -116,14 +125,18 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	started := time.Now()
 	var shutdownOnce sync.Once
 	done := make(chan struct{})
-	shutdown := func() {
+	// shutdown stops listening at once (a successor can take the port and
+	// the lock), runs successor if set, then finishes the streams in flight.
+	shutdown := func(successor func()) {
 		shutdownOnce.Do(func() {
-			// Stop listening at once (a successor can take the port and the
-			// lock), then finish the streams in flight.
 			log.Info("handing over; finishing in-flight requests")
 			ctl.Close()
 			os.Remove(sock)
+			ln.Close() // free the port before the successor starts
 			release()
+			if successor != nil {
+				successor()
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
 			defer cancel()
 			data.Shutdown(ctx)
@@ -175,7 +188,17 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 			return tok, nil
 		},
 		Usage:    srv.UsageJSON(),
-		Shutdown: shutdown,
+		Shutdown: func() { shutdown(nil) },
+		Restart: func() {
+			mu.Lock()
+			cur := env
+			mu.Unlock()
+			shutdown(func() {
+				if err := wrap.SpawnDaemon(cur); err != nil {
+					log.Error("restart: starting the successor failed", "err", err.Error())
+				}
+			})
+		},
 	}}
 
 	log.Info("cproxy daemon running", "version", version.String(), "listen", "http://"+addr,
@@ -196,7 +219,7 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	})
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	go func() { <-stop; shutdown() }()
+	go func() { <-stop; shutdown(nil) }()
 
 	<-done
 	return nil

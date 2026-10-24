@@ -221,3 +221,76 @@ func TestDaemonHandOverKeepsStreams(t *testing.T) {
 		t.Fatalf("the stream was cut by the hand-over: %q", body)
 	}
 }
+
+// `cproxy daemon restart` from a shell without the launch's configuration:
+// the successor keeps the accounts the old daemon was handed, takes over
+// its address, and a stream in flight finishes; `stop` then leaves none.
+func TestDaemonRestartAndStop(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	finish := func() { releaseOnce.Do(func() { close(release) }) }
+	started := make(chan struct{}, 1)
+	env := daemonEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		if r.URL.Path != "/v1/messages" { // the usage poller: answer at once
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		io.WriteString(w, "data: one\n\n")
+		w.(http.Flusher).Flush()
+		started <- struct{}{}
+		<-release
+		io.WriteString(w, "data: two\n\n")
+	})
+	t.Cleanup(finish) // registered after daemonEnv's: runs before the upstream closes
+	c, st, err := wrap.EnsureDaemon(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, _ := c.Register("claude-local", "")
+	got := make(chan string, 1)
+	go func() {
+		req, _ := http.NewRequest("POST", "http://"+st.Addr+"/v1/messages", strings.NewReader("{}"))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			got <- err.Error()
+			return
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		got <- string(b)
+	}()
+	<-started
+
+	// This process's environment has CPROXY_HOME but no account tokens.
+	var out strings.Builder
+	daemonRestartCmd.SetOut(&out)
+	if err := daemonRestartCmd.RunE(daemonRestartCmd, nil); err != nil {
+		t.Fatal(err)
+	}
+	c2, next, err := daemon.Dial()
+	if err != nil || next.PID == st.PID || next.Addr != st.Addr {
+		t.Fatalf("after restart: %v pid %d→%d addr %s→%s\n%s", err, st.PID, next.PID, st.Addr, next.Addr, out.String())
+	}
+	body, _ := c2.Usage()
+	var snap proxy.UsageSnapshot
+	json.Unmarshal(body, &snap)
+	if len(snap.Accounts) != 1 {
+		t.Fatalf("restarted daemon has %d accounts, want the 1 the old one was handed", len(snap.Accounts))
+	}
+	finish()
+	if body := <-got; !strings.Contains(body, "data: two") {
+		t.Fatalf("the stream was cut by the restart: %q", body)
+	}
+
+	out.Reset()
+	daemonStopCmd.SetOut(&out)
+	if err := daemonStopCmd.RunE(daemonStopCmd, nil); err != nil || !strings.Contains(out.String(), "stopped") {
+		t.Fatalf("stop: %v %s", err, out.String())
+	}
+	if _, _, err := daemon.Dial(); err == nil {
+		t.Fatal("a daemon still answers after stop")
+	}
+}

@@ -44,7 +44,7 @@ func ensureDaemon(environ []string, sync bool) (*daemon.Client, daemon.Status, e
 		err = errors.New("handed over")
 	}
 	if err != nil {
-		if err := spawnDaemon(environ); err != nil {
+		if err := SpawnDaemon(environ); err != nil {
 			return nil, daemon.Status{}, err
 		}
 		if c, st, err = waitDaemon(daemonStartTimeout); err != nil {
@@ -60,10 +60,10 @@ func ensureDaemon(environ []string, sync bool) (*daemon.Client, daemon.Status, e
 	return c, st, nil
 }
 
-// spawnDaemon starts a detached `cproxy daemon` that inherits environ and
+// SpawnDaemon starts a detached `cproxy daemon` that inherits environ and
 // logs to daemon.LogPath(). Concurrent launches may each start one; the
 // lock lets one win and the others exit at once.
-func spawnDaemon(environ []string) error {
+func SpawnDaemon(environ []string) error {
 	self, err := os.Executable()
 	if err != nil {
 		return err
@@ -99,6 +99,55 @@ func waitDaemon(d time.Duration) (*daemon.Client, daemon.Status, error) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// RestartDaemon has the running daemon hand over to a fresh one of the
+// installed cproxy, which keeps the old daemon's configuration, and returns
+// both statuses (prev is zero when none ran: then it just starts one with
+// environ). An older daemon without the restart request is stopped and
+// replaced by one started with environ instead.
+func RestartDaemon(environ []string) (prev, next daemon.Status, err error) {
+	c, prev, err := daemon.Dial()
+	if err != nil {
+		_, next, err = ConnectDaemon(environ)
+		return daemon.Status{}, next, err
+	}
+	switch err := c.Restart(); {
+	case errors.Is(err, daemon.ErrUnsupported):
+		if err := c.Shutdown(); err != nil {
+			return prev, daemon.Status{}, err
+		}
+		waitGone(5 * time.Second)
+		if err := SpawnDaemon(environ); err != nil {
+			return prev, daemon.Status{}, err
+		}
+	case err != nil:
+		return prev, daemon.Status{}, err
+	}
+	deadline := time.Now().Add(daemonStartTimeout)
+	for {
+		if _, next, err = daemon.Dial(); err == nil && next.PID != prev.PID {
+			return prev, next, nil
+		}
+		if time.Now().After(deadline) {
+			return prev, daemon.Status{}, fmt.Errorf("no new cproxy daemon came up (log: %s)", daemon.LogPath())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// StopDaemon has the running daemon stop listening and finish its streams
+// in the background; ok is false when none ran.
+func StopDaemon() (st daemon.Status, ok bool, err error) {
+	c, st, err := daemon.Dial()
+	if err != nil {
+		return daemon.Status{}, false, nil
+	}
+	if err := c.Shutdown(); err != nil {
+		return st, true, err
+	}
+	waitGone(5 * time.Second)
+	return st, true, nil
 }
 
 // waitGone waits for a daemon that is handing over to release its socket.
