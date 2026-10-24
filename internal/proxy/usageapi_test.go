@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -255,6 +256,20 @@ func TestUsageAPILazilyStartedByFirstView(t *testing.T) {
 	if len(usageAPIHits(t, up)) != 1 {
 		t.Fatalf("usage API hits after first view: %d", len(usageAPIHits(t, up)))
 	}
+
+	// A view while the reading is fresh does not refetch; one after its
+	// refresh interval (say, the poller sat idle) refetches before answering.
+	doReq(t, "GET", ts.URL+"/usage?format=json", bearerHeaders("cp_alice"), "")
+	if got := len(usageAPIHits(t, up)); got != 1 {
+		t.Fatalf("fresh reading refetched on view: %d hits", got)
+	}
+	srv.usage.mu.Lock()
+	srv.usage.entries["main"].retryAt = time.Now().Add(-time.Second)
+	srv.usage.mu.Unlock()
+	doReq(t, "GET", ts.URL+"/usage?format=json", bearerHeaders("cp_alice"), "")
+	if got := len(usageAPIHits(t, up)); got != 2 {
+		t.Fatalf("stale reading not refreshed before the view: %d hits", got)
+	}
 }
 
 func TestUsageAPIForbiddenBackoff(t *testing.T) {
@@ -292,8 +307,15 @@ func TestUsageAPIForbiddenBackoff(t *testing.T) {
 	}
 }
 
+// A rate-limited refresh backs off as told and keeps the last reading,
+// which the dashboard shows with the error and its age.
 func TestUsageAPIRetryAfterHonored(t *testing.T) {
+	var limited atomic.Bool
 	up := newFakeUpstream(t, func(w http.ResponseWriter, h hit) {
+		if h.path == usageAPIPath && !limited.Load() {
+			io.WriteString(w, cannedUsageAPI)
+			return
+		}
 		if h.path == usageAPIPath {
 			w.Header().Set("Retry-After", "120")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -302,10 +324,16 @@ func TestUsageAPIRetryAfterHonored(t *testing.T) {
 		w.WriteHeader(200)
 	})
 	accts := []pool.Account{{Name: "main", Type: pool.TokenTypeOAuth, Token: "sk-ant-oat01-tokMAIN"}}
-	srv, _ := newStartedServer(t, up.URL, testRuntime(accts, nil))
+	clients := map[string]config.ClientAuth{"cp_alice": {Name: "alice"}}
+	srv, ts := newStartedServer(t, up.URL, testRuntime(accts, clients))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	srv.pollUsageOnce(ctx)
+	limited.Store(true)
+	srv.usage.mu.Lock()
+	srv.usage.entries["main"].retryAt = time.Time{} // due again
+	srv.usage.mu.Unlock()
 	srv.pollUsageOnce(ctx)
 
 	srv.usage.mu.Lock()
@@ -317,8 +345,15 @@ func TestUsageAPIRetryAfterHonored(t *testing.T) {
 	if wait := time.Until(e.retryAt); wait < 100*time.Second {
 		t.Fatalf("Retry-After 120 not honored: retry in %v", wait)
 	}
-	if e.data != nil {
-		t.Fatalf("failed entry kept data: %+v", e.data)
+	if e.data == nil || e.data.FiveHour.Pct != 42.5 || len(e.data.Scoped) != 1 {
+		t.Fatalf("429 dropped the last reading: %+v", e.data)
+	}
+	frag := doReq(t, "GET", ts.URL+"/usage?fragment=1", bearerHeaders("cp_alice"), "")
+	b, _ := io.ReadAll(frag.Body)
+	for _, want := range []string{"42.5%", "Fable", "usage API: 429 (rate limited); last read"} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("fragment missing %q:\n%s", want, b)
+		}
 	}
 }
 

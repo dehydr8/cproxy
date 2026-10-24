@@ -37,7 +37,7 @@ const (
 	usageMinBackoff  = 30 * time.Second
 	usageMaxBackoff  = 30 * time.Minute
 	usageForbidden   = 30 * time.Minute // 403: token lacks the scope
-	usageWarmWait    = 2 * time.Second  // first view waits for first cycle
+	usageWarmWait    = 5 * time.Second  // a view waits this long for a due refresh
 	usageIdleAfter   = 5 * time.Minute  // stop polling when nobody has looked
 )
 
@@ -296,8 +296,9 @@ func (p *usagePoller) due(name string, now time.Time) bool {
 }
 
 // record stores one fetch result: fresh data on success, or the error (and
-// a backoff schedule) on failure. Failed entries drop stale data so the
-// dashboard never shows numbers the token can no longer stand behind.
+// a backoff schedule) on failure. A transient failure (429, 5xx, network)
+// keeps the last reading, shown with its age next to the error; a refused
+// token (401/403) drops it, since the token can no longer stand behind it.
 func (p *usagePoller) record(name string, data *UsageAPI, err error, now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -312,13 +313,14 @@ func (p *usagePoller) record(name string, data *UsageAPI, err error, now time.Ti
 		e.retryAt = now.Add(usageFreshFor)
 		return
 	}
-	e.data, e.err = nil, err.Error()
+	e.err = err.Error()
 	var ue403 *usageAPIError
 	e.forbidden = errors.As(err, &ue403) && ue403.status == http.StatusForbidden
 	var wait time.Duration
 	if ue, ok := err.(*usageAPIError); ok {
 		switch {
 		case ue.status == http.StatusForbidden || ue.status == http.StatusUnauthorized:
+			e.data = nil // the token itself is refused: its old numbers no longer stand
 			wait = usageForbidden
 		case ue.retryAfter > 0:
 			wait = ue.retryAfter
@@ -523,16 +525,12 @@ func (s *Server) runProbe(name, token string) {
 	s.log.Info("usage probe", "account", name, "dur", took)
 }
 
-// pollUsageLoop keeps usage warm while anyone is watching: one immediate
-// refresh, then a tick every 15s (successful entries are re-fetched at most
-// once per minute, failures back off). Ticks are skipped once no usage view
-// has arrived for usageIdleAfter, so an unwatched server stops querying the
-// usage API until the next view.
+// pollUsageLoop keeps usage warm while anyone is watching: a refresh every
+// 15s (successful entries are re-fetched at most once per minute, failures
+// back off). Ticks are skipped once no usage view has arrived for
+// usageIdleAfter, so an unwatched server stops querying the usage API until
+// the next view, which refreshes it itself.
 func (s *Server) pollUsageLoop() {
-	ctx, cancel := context.WithTimeout(context.Background(), usageCycleBudget)
-	s.pollUsageOnce(ctx)
-	cancel()
-	close(s.usageWarm)
 	t := time.NewTicker(usageTick)
 	defer t.Stop()
 	for {
@@ -541,23 +539,62 @@ func (s *Server) pollUsageLoop() {
 			if time.Since(time.Unix(0, s.usageViewed.Load())) > usageIdleAfter {
 				continue
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), usageCycleBudget)
-			s.pollUsageOnce(ctx)
-			cancel()
+			<-s.refreshUsage()
 		case <-s.usageStop:
 			return
 		}
 	}
 }
 
-// ensureUsageWarm lazily starts the poller on the first usage view and
-// waits briefly for its first cycle, so the first dashboard or `cproxy
-// usage` view already shows live numbers. Later calls return immediately.
+// refreshUsage starts one poll cycle, or joins the one already running, and
+// returns a channel closed when it ends.
+func (s *Server) refreshUsage() <-chan struct{} {
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	if s.usageRun != nil {
+		return s.usageRun
+	}
+	done := make(chan struct{})
+	s.usageRun = done
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), usageCycleBudget)
+		s.pollUsageOnce(ctx)
+		cancel()
+		s.usageMu.Lock()
+		s.usageRun = nil
+		s.usageMu.Unlock()
+		close(done)
+	}()
+	return done
+}
+
+// usageDue reports whether any OAuth account's reading is older than its
+// refresh interval (or its failure backoff has passed).
+func (s *Server) usageDue(now time.Time) bool {
+	st := s.state.Load()
+	if st == nil || st.Runtime == nil {
+		return false
+	}
+	for _, a := range st.Runtime.Accounts {
+		if a.Type == pool.TokenTypeOAuth && a.Token != "" && s.usage.due(a.Name, now) {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureUsageWarm lazily starts the poller on the first usage view and,
+// when any account's reading is past its refresh interval (the first view,
+// or one after the poller went idle), refreshes it before the view renders,
+// waiting at most usageWarmWait. Views of fresh data return immediately.
 func (s *Server) ensureUsageWarm() {
 	s.usageViewed.Store(time.Now().UnixNano())
 	s.usageOnce.Do(func() { go s.pollUsageLoop() })
+	if !s.usageDue(time.Now()) {
+		return
+	}
 	select {
-	case <-s.usageWarm:
+	case <-s.refreshUsage():
 	case <-time.After(usageWarmWait):
 	}
 }
@@ -566,6 +603,28 @@ func (s *Server) ensureUsageWarm() {
 // process; Close is for graceful shutdowns and tests.
 func (s *Server) Close() {
 	s.closeOnce.Do(func() { close(s.usageStop) })
+}
+
+// CurrentUsage is an account's freshest known usage: its last usage API (or
+// probe) reading, with the 5-hour and 7-day windows replaced by any that
+// response headers reported since. Per-model limits and spend, which
+// headers do not carry, stay from that reading. fromHeaders reports whether
+// the windows came from headers; u is nil when neither source has any.
+func CurrentUsage(api *UsageAPI, rl *pool.RateLimitInfo) (u *UsageAPI, fromHeaders bool) {
+	if rl == nil || (rl.FiveHourPct == nil && rl.SevenDayPct == nil) || (api != nil && !rl.Seen.After(api.FetchedAt)) {
+		return api, false
+	}
+	var out UsageAPI
+	if api != nil {
+		out = *api
+	}
+	if rl.FiveHourPct != nil {
+		out.FiveHour = &UsageAPIWindow{Pct: *rl.FiveHourPct, ResetsAt: rl.FiveHourReset}
+	}
+	if rl.SevenDayPct != nil {
+		out.SevenDay = &UsageAPIWindow{Pct: *rl.SevenDayPct, ResetsAt: rl.SevenDayReset}
+	}
+	return &out, true
 }
 
 // UsageAPISummary renders real usage API numbers for the dashboard and the
