@@ -245,6 +245,10 @@ func renderUsage(out io.Writer, snap proxy.UsageSnapshot, where string, now time
 		for _, m := range meters {
 			fmt.Fprintf(&b, "  %-11s %s %s  %s\n", trunc(m.label, 11), p.bar(m.pct), p.tone(m.pct, fmt.Sprintf("%-6s", m.value)), p.dim(m.note))
 		}
+		if len(meters) > 0 && a.UsageAPIErr != "" && a.UsageAPI != nil {
+			// The last refresh failed: say so, and how old the reading is.
+			fmt.Fprintln(&b, "  "+p.dim(a.UsageAPIErr+" · last read "+agoString(&a.UsageAPI.FetchedAt, now)))
+		}
 		if len(meters) == 0 {
 			switch {
 			case a.UsageAPIErr != "":
@@ -299,8 +303,8 @@ type meterLine struct {
 	pct                float64
 }
 
-// accountMeters lists an account's windows: from the usage API when
-// available, else the subscription windows from its last response headers.
+// accountMeters lists an account's windows and limits from its freshest
+// usage (see proxy.CurrentUsage).
 func accountMeters(a proxy.UsageAccount, now time.Time) []meterLine {
 	var out []meterLine
 	reset := func(t *time.Time) string {
@@ -319,36 +323,35 @@ func accountMeters(a proxy.UsageAccount, now time.Time) []meterLine {
 		}
 		return v
 	}
-	if u := a.UsageAPI; u != nil {
-		note := func(s string) string { return s }
-		if u.Source == "probe" {
-			note = func(s string) string {
-				return strings.TrimSpace(s + " (Haiku probe " + agoString(&u.FetchedAt, now) + ")")
-			}
-		}
-		if w := u.FiveHour; w != nil {
-			v := level(w.Pct, w.ResetsAt)
-			out = append(out, meterLine{"5-hour", pct(v), note(reset(w.ResetsAt)), v})
-		}
-		if w := u.SevenDay; w != nil {
-			v := level(w.Pct, w.ResetsAt)
-			out = append(out, meterLine{"7-day", pct(v), note(reset(w.ResetsAt)), v})
-		}
-		for _, sc := range u.Scoped {
-			out = append(out, meterLine{sc.Name, pct(sc.Pct), reset(sc.ResetsAt), sc.Pct})
-		}
-		if sp := u.Spend; sp != nil && sp.Limit != nil && sp.Used != nil {
-			out = append(out, meterLine{"Extra usage", pct(sp.Pct), fmt.Sprintf("%s %.2f / %.2f", sp.Currency, *sp.Used, *sp.Limit), sp.Pct})
-		}
-		return out
+	// Fresher response headers update the 5-hour and 7-day windows of the
+	// last usage reading; its per-model limits and spend stay.
+	u, fromHeaders := proxy.CurrentUsage(a.UsageAPI, a.RateLimits)
+	if u == nil {
+		return nil
 	}
-	if rl := a.RateLimits; rl != nil {
-		if rl.FiveHourPct != nil {
-			out = append(out, meterLine{"5-hour", pct(*rl.FiveHourPct), strings.TrimSpace(reset(rl.FiveHourReset) + " (headers)"), *rl.FiveHourPct})
+	note := func(s string) string { return s }
+	switch {
+	case fromHeaders:
+		note = func(s string) string { return strings.TrimSpace(s + " (headers)") }
+	case u.Source == "probe":
+		note = func(s string) string {
+			return strings.TrimSpace(s + " (Haiku probe " + agoString(&u.FetchedAt, now) + ")")
 		}
-		if rl.SevenDayPct != nil {
-			out = append(out, meterLine{"7-day", pct(*rl.SevenDayPct), strings.TrimSpace(reset(rl.SevenDayReset) + " (headers)"), *rl.SevenDayPct})
-		}
+	}
+	if w := u.FiveHour; w != nil {
+		v := level(w.Pct, w.ResetsAt)
+		out = append(out, meterLine{"5-hour", pct(v), note(reset(w.ResetsAt)), v})
+	}
+	if w := u.SevenDay; w != nil {
+		v := level(w.Pct, w.ResetsAt)
+		out = append(out, meterLine{"7-day", pct(v), note(reset(w.ResetsAt)), v})
+	}
+	for _, sc := range u.Scoped {
+		v := level(sc.Pct, sc.ResetsAt)
+		out = append(out, meterLine{sc.Name, pct(v), reset(sc.ResetsAt), v})
+	}
+	if sp := u.Spend; sp != nil && sp.Limit != nil && sp.Used != nil {
+		out = append(out, meterLine{"Extra usage", pct(sp.Pct), fmt.Sprintf("%s %.2f / %.2f", sp.Currency, *sp.Used, *sp.Limit), sp.Pct})
 	}
 	return out
 }

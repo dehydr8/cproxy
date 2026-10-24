@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dehydr8/cproxy/internal/config"
+	"github.com/dehydr8/cproxy/internal/pool"
 	"github.com/dehydr8/cproxy/internal/proxy"
 )
 
@@ -83,6 +84,40 @@ func TestRunUsageCmd(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// A usage reading kept after a failed refresh is shown with the error and
+// its age; response headers seen since update its 5-hour and 7-day windows
+// without dropping the per-model limits only the usage API reports.
+func TestUsageMergesFresherHeadersIntoTheLastReading(t *testing.T) {
+	now := time.Now()
+	read, seen := now.Add(-20*time.Minute), now.Add(-3*time.Second)
+	five, seven := 63.0, 10.0
+	snap := proxy.UsageSnapshot{Accounts: []proxy.UsageAccount{{
+		Name: "btb",
+		UsageAPI: &proxy.UsageAPI{
+			FiveHour:  &proxy.UsageAPIWindow{Pct: 40},
+			SevenDay:  &proxy.UsageAPIWindow{Pct: 8},
+			Scoped:    []proxy.UsageAPIScoped{{Name: "Fable", Pct: 31}},
+			FetchedAt: read,
+		},
+		UsageAPIErr: "usage API: 429 (rate limited)",
+		RateLimits:  &pool.RateLimitInfo{FiveHourPct: &five, SevenDayPct: &seven, Seen: seen},
+	}}}
+	var b strings.Builder
+	if err := renderUsage(&b, snap, "test", now, false); err != nil {
+		t.Fatal(err)
+	}
+	out := b.String()
+	for _, want := range []string{"63%", "10%", "(headers)", "Fable", "31%",
+		"usage API: 429 (rate limited) · last read 20m ago"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "40%") {
+		t.Fatalf("older usage API 5-hour shown over fresher headers:\n%s", out)
 	}
 }
 

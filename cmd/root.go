@@ -51,7 +51,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&quiet, "quiet", "q", false,
 		"suppress per-request logs (errors still print)")
 	rootCmd.AddCommand(runCmd, serveCmd, daemonCmd, dashboardCmd, claudeCmd, installCmd, uninstallCmd,
-		usageCmd, accountsCmd, poolsCmd, tokenCmd, setupTokenCmd, versionCmd)
+		usageCmd, accountsCmd, poolsCmd, tokenCmd, setupTokenCmd, updateCmd, versionCmd)
 }
 
 // Execute runs the CLI; errors are printed and exit non-zero.

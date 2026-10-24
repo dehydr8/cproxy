@@ -60,6 +60,8 @@ or with Go 1.27+:
 go install github.com/dehydr8/cproxy@latest
 ```
 
+Either way, `cproxy update` later moves it to the newest release.
+
 or build from a checkout:
 
 ```sh
@@ -255,6 +257,7 @@ override both. In Amp, keep the tokens in your personal env and set
 | `cproxy accounts add/disable/enable/remove/list` | manage pool accounts in `credentials.json` |
 | `cproxy pools` | list pools, strategies and members |
 | `cproxy token [--scopes …]` | generate a random client token (`cp_…`) |
+| `cproxy update [--check]` | update cproxy in place to the latest release (checksum-verified; `go install` builds via `go install`) |
 | `cproxy version` | print the version |
 
 ## serve mode

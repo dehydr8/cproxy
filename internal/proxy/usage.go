@@ -358,26 +358,28 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 			row.State, row.Tone = "available", "ok"
 			data.Available++
 		}
-		// A probe result is only worth showing until real traffic reports
-		// fresher windows in its response headers.
-		if apiData != nil && apiData.Source == "probe" {
-			if rl := stt.RateLimits; rl != nil && rl.FiveHourPct != nil && rl.Seen.After(apiData.FetchedAt) {
-				apiData = nil
-			} else {
-				row.UsageNote = "via a Haiku probe " + ago(apiData.FetchedAt)
-			}
+		// Fresher response headers update the 5-hour and 7-day windows of
+		// the last usage reading; its per-model limits and spend stay.
+		u, fromHeaders := CurrentUsage(apiData, stt.RateLimits)
+		switch {
+		case apiErr != "" && apiData != nil:
+			row.UsageNote = apiErr + "; last read " + ago(apiData.FetchedAt)
+		case apiErr != "":
+			row.UsageNote = apiErr
+		case apiData != nil && apiData.Source == "probe" && !fromHeaders:
+			row.UsageNote = "via a Haiku probe " + ago(apiData.FetchedAt)
 		}
-		if apiData != nil {
-			if w := apiData.FiveHour; w != nil {
+		if u != nil {
+			if w := u.FiveHour; w != nil {
 				row.Meters = append(row.Meters, newMeter("5-hour", w.Pct, w.ResetsAt, now))
 			}
-			if w := apiData.SevenDay; w != nil {
+			if w := u.SevenDay; w != nil {
 				row.Meters = append(row.Meters, newMeter("7-day", w.Pct, w.ResetsAt, now))
 			}
-			for _, sc := range apiData.Scoped {
+			for _, sc := range u.Scoped {
 				row.Meters = append(row.Meters, newMeter(sc.Name, sc.Pct, sc.ResetsAt, now))
 			}
-			if sp := apiData.Spend; sp != nil {
+			if sp := u.Spend; sp != nil {
 				if sp.Limit != nil {
 					m := newMeter("Extra usage", sp.Pct, sp.ResetsAt, now)
 					m.Text = money(sp.Currency, sp.Used) + " / " + money(sp.Currency, sp.Limit)
@@ -386,23 +388,12 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 					row.Spend = "Extra usage: " + money(sp.Currency, sp.Used) + " spent, no monthly limit"
 				}
 			}
-		} else {
-			row.UsageNote = apiErr
-			if rl := stt.RateLimits; rl != nil {
-				// Without the usage API, the subscription windows from the
-				// last response headers still make meters.
-				if rl.FiveHourPct != nil {
-					row.Meters = append(row.Meters, newMeter("5-hour", *rl.FiveHourPct, rl.FiveHourReset, now))
-				}
-				if rl.SevenDayPct != nil {
-					row.Meters = append(row.Meters, newMeter("7-day", *rl.SevenDayPct, rl.SevenDayReset, now))
-				}
-				if len(row.Meters) > 0 {
-					row.HeaderNote = "as of the last response " + ago(rl.Seen)
-				} else {
-					row.HeaderNote = RateLimitsSummary(rl, now)
-				}
+			if fromHeaders {
+				row.HeaderNote = "as of the last response " + ago(stt.RateLimits.Seen)
 			}
+		} else if rl := stt.RateLimits; rl != nil {
+			// No subscription windows (API keys): summarize the headers.
+			row.HeaderNote = RateLimitsSummary(rl, now)
 		}
 		data.Requests += stt.Requests
 		data.RateLimited += stt.RateLimited

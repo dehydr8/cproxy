@@ -79,7 +79,8 @@ type Server struct {
 
 	usage       *usagePoller // real usage API cache (preferred usage source)
 	usageStop   chan struct{}
-	usageWarm   chan struct{} // closed after the poller's first cycle
+	usageMu     sync.Mutex
+	usageRun    chan struct{} // the running poll cycle, closed when it ends; guarded by usageMu
 	usageViewed atomic.Int64  // unix nanos of the last usage view
 	usageOnce   sync.Once
 	closeOnce   sync.Once
@@ -127,7 +128,6 @@ func New(opts Options) *Server {
 			entries: map[string]*usageEntry{},
 		},
 		usageStop: make(chan struct{}),
-		usageWarm: make(chan struct{}),
 	}
 	s.state.Store(opts.State)
 	return s
