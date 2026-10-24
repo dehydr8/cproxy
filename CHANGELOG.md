@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.8.0](https://github.com/dehydr8/cproxy/compare/v1.7.1...v1.8.0) (2026-10-24)
+
+
+### Features
+
+* `cproxy update` updates cproxy to the latest release ([efa1fe9](https://github.com/dehydr8/cproxy/commit/efa1fe983850028af04bffc19d44b0a4dccdc38f))
+
+
+### Bug Fixes
+
+* usage keeps its last reading through failures and refreshes stale ones on view ([efa1fe9](https://github.com/dehydr8/cproxy/commit/efa1fe983850028af04bffc19d44b0a4dccdc38f))
+
 ## [1.7.1](https://github.com/dehydr8/cproxy/compare/v1.7.0...v1.7.1) (2026-10-18)
 
 
