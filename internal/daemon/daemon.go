@@ -29,6 +29,10 @@ import (
 // ErrRunning means another daemon holds the lock.
 var ErrRunning = errors.New("a cproxy daemon is already running")
 
+// ErrUnsupported means the running daemon predates the request (an older
+// cproxy without that control endpoint).
+var ErrUnsupported = errors.New("the running cproxy daemon does not support this request")
+
 // SocketPath is the daemon's control socket. Unix socket paths are limited
 // to about 104 bytes, so a deep CPROXY_HOME falls back to a per-user path in
 // the temp directory.
@@ -88,6 +92,7 @@ type Handler struct {
 	Register func(name, pool string) (token string, err error)
 	Usage    http.Handler
 	Shutdown func()
+	Restart  func() // hand over to a successor started with the daemon's own environment
 }
 
 func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -131,6 +136,12 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			f.Flush()
 		}
 		go h.Shutdown()
+	case r.Method == http.MethodPost && r.URL.Path == "/restart":
+		writeJSON(w, map[string]bool{"ok": true})
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		go h.Restart()
 	default:
 		http.NotFound(w, r)
 	}
@@ -181,6 +192,9 @@ func (c *Client) do(method, path string, in, out any) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return ErrUnsupported
+	}
 	if resp.StatusCode != http.StatusOK {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("cproxy daemon: %s", strings.TrimSpace(string(msg)))
@@ -224,6 +238,11 @@ func (c *Client) Usage() ([]byte, error) {
 // Shutdown asks the daemon to hand over: it stops listening at once and
 // finishes the requests it is serving in the background.
 func (c *Client) Shutdown() error { return c.do(http.MethodPost, "/shutdown", nil, nil) }
+
+// Restart asks the daemon to hand over to a fresh daemon of the cproxy
+// binary now installed, started with the daemon's own environment (so
+// configuration only a launch handed it survives), then finish its streams.
+func (c *Client) Restart() error { return c.do(http.MethodPost, "/restart", nil, nil) }
 
 // Newer reports whether version a is a newer release than b (vX.Y.Z;
 // development builds compare as neither newer nor older).

@@ -252,6 +252,7 @@ override both. In Amp, keep the tokens in your personal env and set
 | `cproxy install [--path P]` | replace the `claude` binary with the cproxy shim (undo: `cproxy uninstall`) |
 | `cproxy claude [-- args…]` | run the real claude through the local daemon (what the shim execs) |
 | `cproxy daemon` | run the per-user local daemon in the foreground (normally started for you) |
+| `cproxy daemon status/start/stop/restart/logs [-f]` | control the background daemon; `restart` moves it to the installed cproxy and keeps its config and open streams |
 | `cproxy serve [--addr :7788] [--usage-addr A]` | run as a shared server with client-token auth |
 | `cproxy setup-token` | mint a long-lived Anthropic OAuth token via browser sign-in |
 | `cproxy accounts add/disable/enable/remove/list` | manage pool accounts in `credentials.json` |
