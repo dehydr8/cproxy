@@ -1,0 +1,28 @@
+# PRs are squash-merged, and a squash merge of several commits takes the PR
+# title as its commit subject, which is all release-please reads. A title
+# without a conventional type ("feat: …", "fix(usage): …") never makes a
+# release.
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  conventional:
+    runs-on: ubuntu-latest
+    steps:
+      - name: check the title is a conventional commit
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          types='feat|fix|perf|deps|revert|docs|style|chore|refactor|test|build|ci'
+          if printf '%s' "$TITLE" | grep -Eq "^($types)(\([^)]+\))?!?: [^ ]"; then
+            echo "ok: $TITLE"
+            exit 0
+          fi
+          echo "::error::PR title \"$TITLE\" is not a conventional commit. Use \"<type>[(scope)][!]: summary\" with type one of: ${types//|/, }. feat and fix cut a release; the squash merge commit takes this title."
+          exit 1
