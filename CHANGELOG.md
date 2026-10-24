@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.9.0](https://github.com/dehydr8/cproxy/compare/v1.8.0...v1.9.0) (2026-10-24)
+
+
+### Features
+
+* `cproxy daemon status/start/stop/restart/logs` control the local daemon ([#29](https://github.com/dehydr8/cproxy/issues/29)) ([ed3f044](https://github.com/dehydr8/cproxy/commit/ed3f04476c5440846f62c08e68a80aefba565966))
+
 ## [1.8.0](https://github.com/dehydr8/cproxy/compare/v1.7.1...v1.8.0) (2026-10-24)
 
 
