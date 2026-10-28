@@ -99,7 +99,9 @@ then launches the command — `claude` by default — with `ANTHROPIC_BASE_URL`
 and `ANTHROPIC_AUTH_TOKEN` pointed at it. Arguments after `--` that start
 with a flag go to claude, so `cproxy run --pool cvp -- --resume x` works
 like cswap's run. Ambient Anthropic credentials and `CPROXY_*` secrets are
-stripped from the child's environment. The child shares cproxy's process
+stripped from the child's environment, and `CLAUDE_CODE_PROMPT_CACHE_TTL=1h`
+is set unless you set it yourself (see [Prompt cache TTL](#prompt-cache-ttl)).
+The child shares cproxy's process
 group (Ctrl+C reaches it directly), and cproxy exits with the child's exit
 code. `--isolated` runs a private proxy for one launch instead.
 
@@ -298,6 +300,18 @@ A token with no scopes may do both; `{"token": "cp_…", "scopes": ["usage"]}`
 (or `CPROXY_CLIENT_TOKENS=monitor:cp_…:usage`) is a dashboard-only token for
 someone who should see pool health but never spend it.
 
+## Prompt cache TTL
+
+Signed in to claude.ai, Claude Code writes its prompt cache with a 1-hour
+TTL. With `ANTHROPIC_AUTH_TOKEN` set — which is how it talks to cproxy — it
+assumes an API token and drops to 5 minutes, so a conversation idle for more
+than 5 minutes re-pays its whole context. `cproxy run` and the shim set
+`CLAUDE_CODE_PROMPT_CACHE_TTL=1h` for the main conversation to restore that;
+set it yourself (`5m`, or `1h`) to override. Clients of a shared
+`cproxy serve` set it in their own environment. Unlike a signed-in
+subscriber, Claude Code then keeps 1h even after the account is past its plan
+limits.
+
 ## Hosting a shared cproxy
 
 Run one `cproxy serve` that holds the pool, and hand each person (or
@@ -312,6 +326,9 @@ export ANTHROPIC_BASE_URL=https://my-cproxy.fly.dev
 export ANTHROPIC_AUTH_TOKEN=cp_…     # the client token you were given
 claude
 ```
+
+Also set `export CLAUDE_CODE_PROMPT_CACHE_TTL=1h` to keep the 1-hour prompt
+cache; see [Prompt cache TTL](#prompt-cache-ttl).
 
 If the cproxy shim is installed on that machine it sees `ANTHROPIC_BASE_URL`
 and stays out of the way. In Amp, set those two variables (the token as a
