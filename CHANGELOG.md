@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.10.0](https://github.com/dehydr8/cproxy/compare/v1.9.0...v1.10.0) (2026-10-28)
+
+
+### Features
+
+* **launch:** add opt-in entrypoint relabeling via CPROXY_ENTRYPOINT ([#33](https://github.com/dehydr8/cproxy/issues/33)) ([de54322](https://github.com/dehydr8/cproxy/commit/de54322ec47178e6c5f80c3f0922a68e83772721))
+
+
+### Bug Fixes
+
+* keep Claude Code's 1h prompt cache behind cproxy ([#31](https://github.com/dehydr8/cproxy/issues/31)) ([6e18618](https://github.com/dehydr8/cproxy/commit/6e18618321ebc3951392b8a11bc5ec7fd811707c))
+
 ## [1.9.0](https://github.com/dehydr8/cproxy/compare/v1.8.0...v1.9.0) (2026-10-24)
 
 
