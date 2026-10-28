@@ -49,6 +49,9 @@ func TestBuildChildEnv(t *testing.T) {
 			t.Fatalf("child env still contains CPROXY_* entry %q", kv)
 		}
 	}
+	if set["CLAUDE_CODE_PROMPT_CACHE_TTL"] != "1h" {
+		t.Fatalf("prompt cache TTL = %q, want 1h", set["CLAUDE_CODE_PROMPT_CACHE_TTL"])
+	}
 	if !slices.Contains(got, "PATH=/usr/bin:/bin") || !slices.Contains(got, "HOME=/home/u") || !slices.Contains(got, "ANTHROPIC_MODEL=opus") {
 		t.Fatalf("unrelated vars dropped: %v", got)
 	}
@@ -86,5 +89,21 @@ func TestRunSignalExitCode(t *testing.T) {
 func TestRunMissingCommand(t *testing.T) {
 	if _, err := Run(nil, os.Environ()); err == nil {
 		t.Fatal("nil argv accepted")
+	}
+}
+
+func TestBuildChildEnvKeepsPromptCacheTTL(t *testing.T) {
+	got := BuildChildEnv([]string{"CLAUDE_CODE_PROMPT_CACHE_TTL=5m"}, "http://127.0.0.1:4123", "cp_sess")
+	n := 0
+	for _, kv := range got {
+		if k, v, _ := cut(kv); k == "CLAUDE_CODE_PROMPT_CACHE_TTL" {
+			n++
+			if v != "5m" {
+				t.Fatalf("prompt cache TTL = %q, want the caller's 5m", v)
+			}
+		}
+	}
+	if n != 1 {
+		t.Fatalf("prompt cache TTL set %d times, want 1", n)
 	}
 }
