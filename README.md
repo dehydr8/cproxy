@@ -101,6 +101,10 @@ with a flag go to claude, so `cproxy run --pool cvp -- --resume x` works
 like cswap's run. Ambient Anthropic credentials and `CPROXY_*` secrets are
 stripped from the child's environment, and `CLAUDE_CODE_PROMPT_CACHE_TTL=1h`
 is set unless you set it yourself (see [Prompt cache TTL](#prompt-cache-ttl)).
+`CLAUDE_CODE_ENTRYPOINT` is left as the environment has it — stock behaviour
+— unless `CPROXY_ENTRYPOINT` opts the launch into the custom-label workaround
+for the faster-draining `sdk-*` rate (see
+[The 5-hour meter and the entrypoint label](#the-5-hour-meter-and-the-entrypoint-label)).
 The child shares cproxy's process
 group (Ctrl+C reaches it directly), and cproxy exits with the child's exit
 code. `--isolated` runs a private proxy for one launch instead.
@@ -221,6 +225,7 @@ orbs, CI, or anywhere you don't want a credentials file:
 | `CPROXY_CLIENT_TOKENS` | several client tokens in one variable: `name:token[:scopes]`, scopes `+`-separated |
 | `CPROXY_UPSTREAM` | upstream base URL (default `https://api.anthropic.com`) |
 | `CPROXY_HOME` | config directory (default `~/.cproxy`) |
+| `CPROXY_ENTRYPOINT` | custom `CLAUDE_CODE_ENTRYPOINT` label for the launch (unset, `off` or `0` leaves the variable untouched) |
 
 One variable per account is the easiest to manage as secrets: adding,
 rotating or removing an account touches only its own variable.
@@ -312,6 +317,42 @@ set it yourself (`5m`, or `1h`) to override. Clients of a shared
 subscriber, Claude Code then keeps 1h even after the account is past its plan
 limits.
 
+## The 5-hour meter and the entrypoint label
+
+Anthropic's plan meters currently charge headless Claude Code — `claude -p`
+and Agent SDK apps like T3 Code — about 1.7× to 2.9× more of the 5-hour
+window per token than the same tokens from the interactive CLI, because those
+sessions label their requests `sdk-cli`/`sdk-ts` and that label is what is
+weighted ([anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074),
+[pingdotgg/t3code#24649](https://github.com/pingdotgg/t3code/issues/24649)).
+Weekly limits are not affected. Every request carries the label, as
+`cc_entrypoint` in its billing block and in the User-Agent, and it comes from
+`CLAUDE_CODE_ENTRYPOINT` in Claude Code's environment.
+
+cproxy can apply the same workaround: `cproxy run` and the shim launch claude
+with `CLAUDE_CODE_ENTRYPOINT=$CPROXY_ENTRYPOINT` (any custom name, e.g.
+`acme-agent`), so its requests carry a custom client label — the same
+workaround T3 Code and Paseo ship — and skip the `sdk-*` weighting. The name
+must be custom: headless claude rewrites the literal `cli` (the interactive
+TUI's default) to `sdk-cli`, so `cli` and `sdk-*` values are treated like
+unset. With the variable unset — or `off` or `0` — cproxy leaves
+`CLAUDE_CODE_ENTRYPOINT` exactly as the environment has it, including
+absent: stock claude behaviour. An interactive TUI launched through cproxy
+needs no label either way; claude defaults it to `cli` itself.
+
+Clients of a shared `cproxy serve` set it in their own environment, like the
+prompt cache TTL:
+
+```sh
+export CLAUDE_CODE_ENTRYPOINT=acme-agent   # any custom name
+```
+
+This is a workaround for an Anthropic-side bug, not an Anthropic-confirmed
+fix: it only changes how usage is attributed (custom labels are the same
+mechanism official surfaces like the VS Code extension use). It is opt-in —
+no launch is labeled unless `CPROXY_ENTRYPOINT` is set — so there is nothing
+to undo once the metering is fixed upstream.
+
 ## Hosting a shared cproxy
 
 Run one `cproxy serve` that holds the pool, and hand each person (or
@@ -328,10 +369,16 @@ claude
 ```
 
 Also set `export CLAUDE_CODE_PROMPT_CACHE_TTL=1h` to keep the 1-hour prompt
-cache; see [Prompt cache TTL](#prompt-cache-ttl).
+cache; see [Prompt cache TTL](#prompt-cache-ttl). And set
+`export CLAUDE_CODE_ENTRYPOINT=acme-agent` (any custom name) so headless use
+is not charged the `sdk-*` rate; see
+[The 5-hour meter and the entrypoint label](#the-5-hour-meter-and-the-entrypoint-label).
+This one has to be the environment variable, not the settings `env` block:
+cproxy is not launching claude there, and claude applies that block only to
+processes it spawns.
 
 If the cproxy shim is installed on that machine it sees `ANTHROPIC_BASE_URL`
-and stays out of the way. In Amp, set those two variables (the token as a
+and stays out of the way. In Amp, set those variables (the token as a
 secret) in your personal or project env instead of `CPROXY_TOKEN_*`.
 
 ### On the server

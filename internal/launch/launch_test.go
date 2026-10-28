@@ -107,3 +107,46 @@ func TestBuildChildEnvKeepsPromptCacheTTL(t *testing.T) {
 		t.Fatalf("prompt cache TTL set %d times, want 1", n)
 	}
 }
+
+func TestBuildChildEnvEntrypoint(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want []string // CLAUDE_CODE_ENTRYPOINT values the child env must hold
+	}{
+		{name: "no flag sets nothing", env: nil, want: nil},
+		{name: "no flag leaves inherited custom alone", env: []string{"CLAUDE_CODE_ENTRYPOINT=my-tool"}, want: []string{"my-tool"}},
+		{name: "no flag leaves inherited sdk-cli alone", env: []string{"CLAUDE_CODE_ENTRYPOINT=sdk-cli"}, want: []string{"sdk-cli"}},
+		{name: "no flag leaves inherited sdk-ts alone", env: []string{"CLAUDE_CODE_ENTRYPOINT=sdk-ts"}, want: []string{"sdk-ts"}},
+		{name: "no flag leaves inherited cli alone", env: []string{"CLAUDE_CODE_ENTRYPOINT=cli"}, want: []string{"cli"}},
+		{name: "no flag leaves inherited empty alone", env: []string{"CLAUDE_CODE_ENTRYPOINT="}, want: []string{""}},
+		{name: "flag names label", env: []string{"CPROXY_ENTRYPOINT=paseo"}, want: []string{"paseo"}},
+		{name: "flag trims label", env: []string{"CPROXY_ENTRYPOINT=  paseo  "}, want: []string{"paseo"}},
+		{name: "flag replaces inherited sdk-ts", env: []string{"CPROXY_ENTRYPOINT=paseo", "CLAUDE_CODE_ENTRYPOINT=sdk-ts"}, want: []string{"paseo"}},
+		{name: "flag replaces inherited custom", env: []string{"CPROXY_ENTRYPOINT=paseo", "CLAUDE_CODE_ENTRYPOINT=my-tool"}, want: []string{"paseo"}},
+		{name: "flag cli touches nothing", env: []string{"CPROXY_ENTRYPOINT=cli"}, want: nil},
+		{name: "flag cli leaves inherited alone", env: []string{"CPROXY_ENTRYPOINT=cli", "CLAUDE_CODE_ENTRYPOINT=cli"}, want: []string{"cli"}},
+		{name: "flag sdk-ts touches nothing", env: []string{"CPROXY_ENTRYPOINT=sdk-ts"}, want: nil},
+		{name: "flag off sets nothing", env: []string{"CPROXY_ENTRYPOINT=off"}, want: nil},
+		{name: "flag off leaves inherited alone", env: []string{"CPROXY_ENTRYPOINT=off", "CLAUDE_CODE_ENTRYPOINT=sdk-cli"}, want: []string{"sdk-cli"}},
+		{name: "flag zero sets nothing", env: []string{"CPROXY_ENTRYPOINT=0"}, want: nil},
+		{name: "flag empty sets nothing", env: []string{"CPROXY_ENTRYPOINT="}, want: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := entrypointValues(BuildChildEnv(tc.env, "http://127.0.0.1:4123", "cp_sess"))
+			if !slices.Equal(got, tc.want) {
+				t.Fatalf("CLAUDE_CODE_ENTRYPOINT = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func entrypointValues(env []string) []string {
+	var got []string
+	for _, kv := range env {
+		if k, v, ok := cut(kv); ok && k == "CLAUDE_CODE_ENTRYPOINT" {
+			got = append(got, v)
+		}
+	}
+	return got
+}
