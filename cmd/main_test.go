@@ -24,7 +24,7 @@ func scrubEnv() {
 	for _, kv := range os.Environ() {
 		k, _, _ := strings.Cut(kv, "=")
 		if strings.HasPrefix(k, "CPROXY_") || strings.HasPrefix(k, "ANTHROPIC_") ||
-			k == "CLAUDE_CODE_OAUTH_TOKEN" || k == "AMP_THREAD_ID" {
+			k == "CLAUDE_CODE_OAUTH_TOKEN" {
 			os.Unsetenv(k)
 		}
 	}

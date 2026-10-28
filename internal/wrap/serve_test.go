@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -42,7 +41,6 @@ func cproxyKnowing(token string) http.Handler {
 }
 
 func TestVerifyWaitsForReload(t *testing.T) {
-	t.Setenv("AMP_THREAD_ID", "")
 	// A running serve learns a just-created local token on its next reload.
 	var h atomic.Value
 	h.Store(cproxyKnowing("cp_old"))
@@ -58,7 +56,6 @@ func TestVerifyWaitsForReload(t *testing.T) {
 }
 
 func TestVerifyRefusesWrongListener(t *testing.T) {
-	t.Setenv("AMP_THREAD_ID", "")
 	old := verifyGrace
 	verifyGrace = 0
 	t.Cleanup(func() { verifyGrace = old })
@@ -96,32 +93,5 @@ func TestVerifyRefusesWrongListener(t *testing.T) {
 		if strings.Contains(s, token) {
 			t.Fatalf("the client token reached a foreign listener: %s", s)
 		}
-	}
-}
-
-func TestExposeUsagePortal(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv(config.EnvHome, home)
-	t.Setenv("AMP_THREAD_ID", "T-test")
-	t.Setenv("AMP_WORKING_DIRECTORY", "") // falls back to CPROXY_HOME
-	// A fake amp CLI that records where and how it was called.
-	bin := t.TempDir()
-	record := filepath.Join(t.TempDir(), "amp-call")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\" > " + record + "\n"
-	if err := os.WriteFile(filepath.Join(bin, "amp"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
-
-	port := 7788
-	ExposeUsagePortal(fmt.Sprintf("127.0.0.1:%d", port), "cp_dash")
-	b, err := os.ReadFile(record)
-	if err != nil {
-		t.Fatalf("amp orb portal was not called: %v", err)
-	}
-	call := strings.Split(strings.TrimSpace(string(b)), "\n")
-	wantURL := fmt.Sprintf("http://127.0.0.1:%d/usage?token=cp_dash", port)
-	if len(call) < 4 || call[0] != home || call[1] != "orb" || call[2] != "portal" || call[3] != wantURL {
-		t.Fatalf("amp called as %q; want `orb portal %s` run from %s", call, wantURL, home)
 	}
 }

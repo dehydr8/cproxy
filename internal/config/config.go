@@ -47,7 +47,7 @@ type FileConfig struct {
 	// LocalToken is the auto-generated local client token (LocalTokenPath),
 	// filled in by Load and never written back to credentials.json.
 	LocalToken string `json:"-"`
-	// DashboardToken is the usage-only token for the orb dashboard portal
+	// DashboardToken is the usage-only token for `cproxy dashboard` links
 	// (DashboardTokenPath), also filled in by Load only.
 	DashboardToken string `json:"-"`
 }

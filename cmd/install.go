@@ -16,9 +16,8 @@ var installCmd = &cobra.Command{
 	Short: "Replace the claude binary with the cproxy shim",
 	Long: `Wrap the installed claude binary: the real binary is moved to
 claude.cproxy-real beside itself and a tiny shim takes its place, so every
-` + "`claude`" + ` launch — including Amp's Claude Code mode in orbs — runs through
-cproxy when credentials are configured, and completely untouched when they
-are not (see ` + "`cproxy claude`" + `).
+` + "`claude`" + ` launch runs through cproxy when credentials are
+configured, and completely untouched when they are not (see ` + "`cproxy claude`" + `).
 
 The shim holds no secrets and no decisions; credentials are read on each
 launch. ` + "`cproxy uninstall`" + ` restores the original binary, and re-running

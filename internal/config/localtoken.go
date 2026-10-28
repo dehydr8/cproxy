@@ -14,7 +14,7 @@ import (
 // wrapper and the serve instance it starts.
 const (
 	LocalClientName     = "claude-local" // proxy + usage
-	DashboardClientName = "dashboard"    // usage only, for the orb portal
+	DashboardClientName = "dashboard"    // usage only, for `cproxy dashboard` links
 )
 
 // LocalTokenPath is where the auto-generated local client token lives. It
@@ -23,9 +23,8 @@ const (
 // is enough to route claude through a local serve.
 func LocalTokenPath() string { return filepath.Join(Home(), "local-token") }
 
-// DashboardTokenPath holds a usage-only token the claude wrapper creates in
-// Amp orbs, so the dashboard portal URL can carry a token that may only
-// look, never spend.
+// DashboardTokenPath holds a usage-only token `cproxy dashboard` creates, so
+// the dashboard link can carry a token that may only look, never spend.
 func DashboardTokenPath() string { return filepath.Join(Home(), "dashboard-token") }
 
 // EnsureLocalToken returns the local client token, creating it on first use.

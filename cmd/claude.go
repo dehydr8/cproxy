@@ -119,14 +119,6 @@ func runClaude(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("a client token is configured but no pool accounts are; add accounts with `cproxy accounts add NAME` or set CPROXY_TOKENS (or run claude per-invocation with `cproxy run -- claude`)")
 	}
 
-	// In an orb the dashboard becomes a portal; give its URL a token that
-	// can only view usage. Created before the daemon starts so it knows it.
-	dashboard := ""
-	if wrap.InAmpOrb() {
-		if dashboard, err = config.EnsureDashboardToken(); err != nil {
-			return fmt.Errorf("create the dashboard token: %w", err)
-		}
-	}
 	// The per-user daemon serves every claude on this machine; start it or
 	// bring its configuration up to date, then make sure it knows our token.
 	environ := os.Environ()
@@ -140,7 +132,6 @@ func runClaude(cmd *cobra.Command, args []string) error {
 	if err := wrap.VerifyWithGrace(st.Addr, token); err != nil {
 		return err
 	}
-	wrap.ExposeUsagePortal(st.Addr, dashboard)
 
 	baseURL := "http://" + st.Addr
 	fileLogger("run.log").Info("cproxy claude",
@@ -205,7 +196,7 @@ func resolveRealClaude(flagVal string) (string, error) {
 }
 
 // discoverClaude finds the claude binary to wrap: --path, else PATH, else
-// the locations Amp also checks (~/.local/bin, ~/bin).
+// the usual user install locations (~/.local/bin, ~/bin).
 func discoverClaude(flagVal string) (string, error) {
 	if flagVal != "" {
 		return flagVal, nil
