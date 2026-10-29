@@ -132,7 +132,7 @@ const (
 //
 // Pass-through (claude runs as if cproxy were not installed) when the
 // environment already carries its own Anthropic routing — an
-// ANTHROPIC_BASE_URL (Amp BYOK, another proxy), or an ANTHROPIC_AUTH_TOKEN
+// ANTHROPIC_BASE_URL (another proxy or gateway), or an ANTHROPIC_AUTH_TOKEN
 // that is not a cproxy client token — or when nothing at all is configured.
 //
 // The token for PlanProxy comes from, in order:

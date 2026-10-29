@@ -74,8 +74,7 @@ go build -o /usr/local/bin/cproxy .
   per-user **daemon** serves every Claude on the machine — launched with
   `cproxy run`, through the installed `claude` shim, from Paseo profiles or
   scripts — so they share one set of sticky pins, cooldowns and usage, and
-  one dashboard. See [The local daemon](#the-local-daemon) and
-  [Using it inside Amp](#using-it-inside-amp).
+  one dashboard. See [The local daemon](#the-local-daemon).
 - **Remote**: one `cproxy serve` holds the pool tokens and several people or
   machines use it. Clients only need its URL and a client token; see
   [Hosting a shared cproxy](#hosting-a-shared-cproxy).
@@ -149,7 +148,7 @@ It logs to `~/.cproxy/daemon.log`; `cproxy daemon` runs it in the foreground.
 
 `cproxy run` only covers launches you make yourself. `cproxy install` makes
 **every** `claude` launch go through cproxy, whatever started it — your
-shell, a script, or Amp's Claude Code mode:
+shell, an editor, or a script:
 
 ```sh
 cproxy install          # wrap claude; `cproxy uninstall` restores it
@@ -210,8 +209,8 @@ one of `sticky` (default), `round-robin`, `least-used`, `random`.
 
 ### Environment configuration
 
-Everything the file can say can also be said with env vars — useful in Amp
-orbs, CI, or anywhere you don't want a credentials file:
+Everything the file can say can also be said with env vars — useful in
+CI, containers, or anywhere you don't want a credentials file:
 
 | Variable | Meaning |
 | --- | --- |
@@ -246,8 +245,7 @@ because account names are global (cooldowns and sticky pins are keyed by
 them), and pool names cannot contain `_`. The same token under several
 variables becomes one account in all of their pools, so one subscription is
 never tracked twice. Env entries override same-named file entries; flags
-override both. In Amp, keep the tokens in your personal env and set
-`CPROXY_POOL` per project.
+override both.
 
 ## Commands
 
@@ -378,8 +376,7 @@ cproxy is not launching claude there, and claude applies that block only to
 processes it spawns.
 
 If the cproxy shim is installed on that machine it sees `ANTHROPIC_BASE_URL`
-and stays out of the way. In Amp, set those variables (the token as a
-secret) in your personal or project env instead of `CPROXY_TOKEN_*`.
+and stays out of the way.
 
 ### On the server
 
@@ -503,71 +500,16 @@ cproxy setup-token --scopes user:inference --expires-in 7776000
 Tokens minted this way are long-lived OAuth tokens like Claude Code's own —
 treat them like passwords.
 
-## Using it inside Amp
+## Amp
 
-Amp threads can run in **Claude Code mode**. The wiring lives entirely in
-the `claude` wrapper — nothing is added to `.agents/setup`,
-`.agents/resume`, or `.amp/services.yaml`, so the repository stays clean
-and machines without cproxy behave exactly as before.
-
-1. Install cproxy in the orb and wrap `claude` (the post-install script
-   below does both).
-2. In Amp's **Secrets & Env Vars** (personal or project), add
-   `CPROXY_TOKEN_<NAME>` per account (or `CPROXY_POOL_TOKEN_<POOL>_<NAME>`
-   plus `CPROXY_POOL`, or the list forms) — the pooled account
-   tokens, marked as secrets. That is all claude needs; the wrapper creates
-   its own local client token. Optionally add `CPROXY_CLIENT_TOKENS`, e.g.
-   `monitor:cp_…:usage` for a dashboard-only viewer.
-3. The first `claude` launch in an orb starts [the local
-   daemon](#the-local-daemon) with those env vars and injects the routing
-   into claude; it sticks to one account, moves on before that account runs
-   out, and fails over on 429.
-4. Every launch also registers the `/usage` dashboard as an orb portal
-   named **cproxy usage**, so the live dashboard is one click away in the
-   thread. Its link carries a generated usage-only token
-   (`~/.cproxy/dashboard-token`), so it opens without asking for one and
-   can only look, never spend. Like every portal it is private to you
-   unless you make it public in Amp.
-
-If the vars are absent the shim injects nothing, so the same setup works
-with or without cproxy. Clients that never launch the `claude` binary point
-at a shared `cproxy serve` with `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`
-instead (the wrapper sees those and stays out of the way).
-
-### Amp post-install script
-
-Set this as Claude Code's **post-install script** (Claude Code Settings in
-Amp; it runs after Amp installs Claude Code and before it launches). It
-installs cproxy and wraps `claude`, only inside Amp orbs:
-
-```sh
-#!/bin/sh
-set -eu
-# Only inside Amp orbs; anywhere else leave claude untouched.
-[ "${AMP_ORB:-}" = "1" ] || exit 0
-export PATH="$HOME/.local/bin:$PATH"
-repo=https://github.com/dehydr8/cproxy
-# Install cproxy, or upgrade it when a newer release is out.
-latest=$(curl -fsSI -o /dev/null -w '%{redirect_url}' "$repo/releases/latest" | sed 's|.*/||') || latest=
-current=$(cproxy version 2>/dev/null | awk '{print $2}') || current=
-if [ -z "$current" ] || { [ -n "$latest" ] && [ "$current" != "$latest" ]; }; then
-  os=$(uname -s | tr '[:upper:]' '[:lower:]')
-  arch=$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
-  tmp=$(mktemp -d)
-  curl -fsSL "$repo/releases/latest/download/cproxy-$os-$arch.tar.gz" | tar xz -C "$tmp"
-  mkdir -p "$HOME/.local/bin"
-  install -m 755 "$tmp/cproxy" "$HOME/.local/bin/cproxy"
-  rm -rf "$tmp"
-fi
-cproxy install
-```
-
-It leaves no credentials behind — `cproxy install` only swaps in the shim;
-credentials arrive per-thread through the project env vars above (or a
-`credentials.json` under `$CPROXY_HOME`, which works too). It is not pinned:
-each run compares the installed cproxy with the latest release and upgrades
-when a newer one is out (keeping the installed one if GitHub is
-unreachable), then reinstalls the shim if Claude Code updated itself.
+Earlier versions documented an Amp setup: a Claude Code **post-install
+script** installed cproxy in each orb and ran `cproxy install`, so Amp's
+Claude Code mode launched `claude` through the shim. Amp has since removed
+that post-install hook, and its Claude Code mode now runs the Claude Agent
+SDK directly instead of launching the `claude` binary, so there is no
+`claude` for the shim to wrap. cproxy no longer has any Amp-specific
+behavior (the orb portal for the dashboard is gone too); use the shim or
+`cproxy run` wherever the `claude` CLI itself is launched.
 
 ## Security notes
 
@@ -592,4 +534,4 @@ Layout: `cmd/` (cobra commands), `internal/config` (file + env config),
 `internal/pool` (strategies, cooldowns, stats), `internal/proxy` (handler,
 failover, usage dashboard), `internal/launch` (child process launching),
 `internal/daemon` (the local daemon's lock, socket and control protocol),
-`internal/wrap` (claude shim install, daemon bootstrap, orb portal).
+`internal/wrap` (claude shim install, daemon bootstrap).
