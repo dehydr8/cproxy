@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.10.1](https://github.com/dehydr8/cproxy/compare/v1.10.0...v1.10.1) (2026-10-29)
+
+
+### Bug Fixes
+
+* drop the Amp orb integration now that Amp runs the Claude Agent SDK ([#34](https://github.com/dehydr8/cproxy/issues/34)) ([e42e04f](https://github.com/dehydr8/cproxy/commit/e42e04fc26a56684a4bcdef946dd38bdf80422d0))
+* poll the usage API within its per-account limit ([#36](https://github.com/dehydr8/cproxy/issues/36)) ([dc6697c](https://github.com/dehydr8/cproxy/commit/dc6697c9841a4e7a7f6eee901a690d5af3495bd7))
+
 ## [1.10.0](https://github.com/dehydr8/cproxy/compare/v1.9.0...v1.10.0) (2026-10-28)
 
 
