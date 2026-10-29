@@ -216,7 +216,7 @@ func TestUsageAPIPollerPreferredOverHeaders(t *testing.T) {
 		t.Fatalf("header fallback shown next to usage API numbers:\n%s", b)
 	}
 
-	// Fresh entries are not re-fetched on the next cycle (60s TTL), and
+	// Fresh entries are not re-fetched on the next cycle (usageFreshFor), and
 	// the identity is fetched once.
 	srv.pollUsageOnce(ctx)
 	if got := len(usageAPIHits(t, up)); got != 1 {
@@ -354,6 +354,64 @@ func TestUsageAPIRetryAfterHonored(t *testing.T) {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("fragment missing %q:\n%s", want, b)
 		}
+	}
+}
+
+// A 429 without a usable Retry-After (the usage API often sends 0) still
+// backs off long, doubling on each repeat, so cproxy does not keep the
+// account's shared limit tripped.
+func TestUsageAPIRateLimitBacksOffLong(t *testing.T) {
+	p := &usagePoller{entries: map[string]*usageEntry{}}
+	now := time.Now()
+	limited := &usageAPIError{status: http.StatusTooManyRequests}
+	p.record("main", nil, limited, now)
+	if wait := p.entries["main"].retryAt.Sub(now); wait < usageLimited {
+		t.Fatalf("first 429 retries in %v; want at least %v", wait, usageLimited)
+	}
+	p.record("main", nil, limited, now)
+	if wait := p.entries["main"].retryAt.Sub(now); wait < 2*usageLimited {
+		t.Fatalf("second 429 retries in %v; want at least %v", wait, 2*usageLimited)
+	}
+	for range 10 {
+		p.record("main", nil, limited, now)
+	}
+	if wait := p.entries["main"].retryAt.Sub(now); wait > usageMaxBackoff+usageMaxBackoff/10 {
+		t.Fatalf("backoff not capped: %v", wait)
+	}
+	// A longer Retry-After wins over the backoff.
+	p.forget("main")
+	p.record("main", nil, &usageAPIError{status: http.StatusTooManyRequests, retryAfter: time.Hour}, now)
+	if wait := p.entries["main"].retryAt.Sub(now); wait < time.Hour {
+		t.Fatalf("Retry-After 1h not honored: %v", wait)
+	}
+	// Success resets the ladder.
+	p.record("main", &UsageAPI{FetchedAt: now}, nil, now)
+	if e := p.entries["main"]; e.backoff != 0 || e.retryAt.Sub(now) < usageFreshFor {
+		t.Fatalf("after success: backoff %v, retry in %v", e.backoff, e.retryAt.Sub(now))
+	}
+}
+
+// Response headers newer than the last reading keep the 5-hour and 7-day
+// windows current, so the reading lives longer before the API is asked.
+func TestUsageAPIDueStretchedByHeaders(t *testing.T) {
+	p := &usagePoller{entries: map[string]*usageEntry{}}
+	read := time.Now()
+	p.record("main", &UsageAPI{FetchedAt: read}, nil, read)
+	later := read.Add(usageFreshFor + usageFreshFor/10 + time.Second)
+	if p.due("main", read.Add(time.Minute), time.Time{}) {
+		t.Fatal("fresh reading due")
+	}
+	if !p.due("main", later, time.Time{}) {
+		t.Fatal("reading past usageFreshFor not due without headers")
+	}
+	if p.due("main", later, read.Add(time.Minute)) {
+		t.Fatal("reading due despite newer headers")
+	}
+	if !p.due("main", read.Add(usageBusyFreshFor), read.Add(time.Minute)) {
+		t.Fatal("reading past usageBusyFreshFor not due")
+	}
+	if !p.due("main", later, read.Add(-time.Minute)) {
+		t.Fatal("headers older than the reading stretched it")
 	}
 }
 
