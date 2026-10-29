@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -33,12 +34,23 @@ const (
 	usageAPITimeout  = 5 * time.Second  // per account fetch
 	usageCycleBudget = 10 * time.Second // per background refresh cycle
 	usageTick        = 15 * time.Second // background poll cadence
-	usageFreshFor    = 60 * time.Second // success TTL
 	usageMinBackoff  = 30 * time.Second
-	usageMaxBackoff  = 30 * time.Minute
+	usageMaxBackoff  = time.Hour
 	usageForbidden   = 30 * time.Minute // 403: token lacks the scope
-	usageWarmWait    = 5 * time.Second  // a view waits this long for a due refresh
-	usageIdleAfter   = 5 * time.Minute  // stop polling when nobody has looked
+
+	// The usage API's limit is undocumented, per account and shared with
+	// every Claude Code session signed in to it, and once tripped it stays
+	// tripped while anyone keeps polling (Retry-After of 0 or ~10 minutes;
+	// anthropics/claude-code#30930, #31637, #77477). Pollers report 429s at
+	// one read a minute and even at one per 5 minutes beside a second
+	// client, so cproxy reads each account at most every 5 minutes, and
+	// every 15 while response headers keep its 5-hour and 7-day windows
+	// current anyway (the API then only adds per-model limits and spend).
+	usageFreshFor     = 5 * time.Minute  // success TTL
+	usageBusyFreshFor = 15 * time.Minute // success TTL while headers are fresh
+	usageLimited      = 10 * time.Minute // first wait after a 429
+	usageWarmWait     = 5 * time.Second  // a view waits this long for a due refresh
+	usageIdleAfter    = 5 * time.Minute  // stop polling when nobody has looked
 )
 
 // UsageAPI is one account's real usage as answered by the usage API. It is
@@ -123,11 +135,7 @@ func oauthGet(ctx context.Context, client *http.Client, upstream *url.URL, token
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		ra := time.Duration(0)
-		if secs, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); err == nil && secs > 0 {
-			ra = time.Duration(secs) * time.Second
-		}
-		return &usageAPIError{status: resp.StatusCode, retryAfter: ra}
+		return &usageAPIError{status: resp.StatusCode, retryAfter: time.Until(retryAfter(resp, 0))}
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out); err != nil {
 		return fmt.Errorf("decoding response: %w", err)
@@ -288,11 +296,21 @@ type usageEntry struct {
 	probing   bool
 }
 
-func (p *usagePoller) due(name string, now time.Time) bool {
+// due reports whether an account's usage should be read now. headersAt is
+// when response headers last reported its windows: newer ones than the last
+// reading stretch that reading's life to usageBusyFreshFor.
+func (p *usagePoller) due(name string, now, headersAt time.Time) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e := p.entries[name]
-	return e == nil || !e.retryAt.After(now)
+	if e == nil {
+		return true
+	}
+	if e.retryAt.After(now) {
+		return false
+	}
+	busy := e.err == "" && e.data != nil && headersAt.After(e.fetchedAt)
+	return !busy || now.Sub(e.fetchedAt) >= usageBusyFreshFor
 }
 
 // record stores one fetch result: fresh data on success, or the error (and
@@ -310,7 +328,7 @@ func (p *usagePoller) record(name string, data *UsageAPI, err error, now time.Ti
 	e.fetchedAt = now
 	if err == nil {
 		e.data, e.err, e.backoff, e.forbidden = data, "", 0, false
-		e.retryAt = now.Add(usageFreshFor)
+		e.retryAt = now.Add(jitter(usageFreshFor))
 		return
 	}
 	e.err = err.Error()
@@ -322,24 +340,33 @@ func (p *usagePoller) record(name string, data *UsageAPI, err error, now time.Ti
 		case ue.status == http.StatusForbidden || ue.status == http.StatusUnauthorized:
 			e.data = nil // the token itself is refused: its old numbers no longer stand
 			wait = usageForbidden
+		case ue.status == http.StatusTooManyRequests:
+			// Retry-After is often 0, and retrying soon only keeps the
+			// shared limit tripped: back off from usageLimited, doubling,
+			// and wait longer still when Retry-After says so.
+			wait = max(e.nextBackoff(usageLimited), ue.retryAfter)
 		case ue.retryAfter > 0:
 			wait = ue.retryAfter
 		default:
-			wait = e.nextBackoff()
+			wait = e.nextBackoff(usageMinBackoff)
 		}
 	} else {
-		wait = e.nextBackoff()
+		wait = e.nextBackoff(usageMinBackoff)
 	}
-	e.retryAt = now.Add(wait)
+	e.retryAt = now.Add(jitter(wait))
 }
 
-func (e *usageEntry) nextBackoff() time.Duration {
-	if e.backoff == 0 {
-		e.backoff = usageMinBackoff
-	} else {
-		e.backoff = min(e.backoff*2, usageMaxBackoff)
-	}
+// nextBackoff doubles the entry's backoff, starting at floor (or jumping to
+// it), up to usageMaxBackoff.
+func (e *usageEntry) nextBackoff(floor time.Duration) time.Duration {
+	e.backoff = min(max(e.backoff*2, floor), usageMaxBackoff)
 	return e.backoff
+}
+
+// jitter stretches d by up to a tenth, so accounts read together drift
+// apart instead of reaching the API in bursts.
+func jitter(d time.Duration) time.Duration {
+	return d + rand.N(d/10+1)
 }
 
 // profileDue reports whether an account's identity should be (re)fetched.
@@ -467,7 +494,7 @@ func (s *Server) pollUsageOnce(ctx context.Context) {
 		if a.Type != pool.TokenTypeOAuth || a.Token == "" {
 			continue
 		}
-		if s.usage.due(a.Name, time.Now()) {
+		if s.usage.due(a.Name, time.Now(), s.headersSeen(a.Name)) {
 			fctx, cancel := context.WithTimeout(ctx, usageAPITimeout)
 			data, err := fetchUsageAPI(fctx, s.client, s.upstream, a.Token)
 			cancel()
@@ -477,11 +504,7 @@ func (s *Server) pollUsageOnce(ctx context.Context) {
 			}
 		}
 		if s.probe != nil {
-			var lastHeaders time.Time
-			if rl := s.sel.StatsSnapshot([]string{a.Name})[a.Name].RateLimits; rl != nil && rl.FiveHourPct != nil {
-				lastHeaders = rl.Seen
-			}
-			if s.usage.claimProbe(a.Name, time.Now(), lastHeaders) {
+			if s.usage.claimProbe(a.Name, time.Now(), s.headersSeen(a.Name)) {
 				go s.runProbe(a.Name, a.Token)
 			}
 		}
@@ -492,6 +515,15 @@ func (s *Server) pollUsageOnce(ctx context.Context) {
 			s.usage.recordProfile(a.Name, prof, err, time.Now())
 		}
 	}
+}
+
+// headersSeen is when response headers last reported an account's windows
+// (zero: never).
+func (s *Server) headersSeen(name string) time.Time {
+	if rl := s.sel.StatsSnapshot([]string{name})[name].RateLimits; rl != nil && rl.FiveHourPct != nil {
+		return rl.Seen
+	}
+	return time.Time{}
 }
 
 // markWindows lets proactive switching see an account's windows from the
@@ -525,9 +557,9 @@ func (s *Server) runProbe(name, token string) {
 	s.log.Info("usage probe", "account", name, "dur", took)
 }
 
-// pollUsageLoop keeps usage warm while anyone is watching: a refresh every
-// 15s (successful entries are re-fetched at most once per minute, failures
-// back off). Ticks are skipped once no usage view has arrived for
+// pollUsageLoop keeps usage warm while anyone is watching: a check every
+// 15s, which re-reads an account only when its reading is past
+// usageFreshFor (see there) or its failure backoff has passed. Ticks are skipped once no usage view has arrived for
 // usageIdleAfter, so an unwatched server stops querying the usage API until
 // the next view, which refreshes it itself.
 func (s *Server) pollUsageLoop() {
@@ -576,7 +608,7 @@ func (s *Server) usageDue(now time.Time) bool {
 		return false
 	}
 	for _, a := range st.Runtime.Accounts {
-		if a.Type == pool.TokenTypeOAuth && a.Token != "" && s.usage.due(a.Name, now) {
+		if a.Type == pool.TokenTypeOAuth && a.Token != "" && s.usage.due(a.Name, now, s.headersSeen(a.Name)) {
 			return true
 		}
 	}

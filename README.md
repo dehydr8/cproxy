@@ -478,9 +478,12 @@ Usage numbers come from three places, freshest first:
 
 Proactive switching uses the freshest of these for every account. Polling
 cadence: the dashboard re-reads cproxy every 2s (no upstream cost); the usage
-API is asked at most once a minute per account and the profile every 6
-hours, both only while a dashboard or `cproxy usage` has been looked at in
-the last 5 minutes, backing off on errors. Upstream tokens are always masked
+API is asked at most every 5 minutes per account (every 15 while response
+headers keep its windows current) and the profile every 6 hours, both only
+while a dashboard or `cproxy usage` has been looked at in the last 5 minutes.
+The usage API's limit is per account and shared with every Claude Code
+session signed in to it, so a 429 backs off 10 minutes, doubling up to an
+hour (longer if Retry-After says so), keeping the last reading on show. Upstream tokens are always masked
 in dashboard and JSON output.
 
 ## setup-token
