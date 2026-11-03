@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.11.0](https://github.com/dehydr8/cproxy/compare/v1.10.1...v1.11.0) (2026-11-03)
+
+
+### Features
+
+* pin per Claude Code session instead of per client ([a78a151](https://github.com/dehydr8/cproxy/commit/a78a151118b6623aed64cf697ecce8b3eeb67e1f))
+
+
+### Bug Fixes
+
+* cool only the limited model when a 429 rejects a per-model limit or extra usage ([a78a151](https://github.com/dehydr8/cproxy/commit/a78a151118b6623aed64cf697ecce8b3eeb67e1f))
+* fail over on 403 and bench the account only when another serves the request ([a78a151](https://github.com/dehydr8/cproxy/commit/a78a151118b6623aed64cf697ecce8b3eeb67e1f))
+* keep an account's cooldown when an in-flight request succeeds ([a78a151](https://github.com/dehydr8/cproxy/commit/a78a151118b6623aed64cf697ecce8b3eeb67e1f))
+* pass fast-mode credit refusals to the client without walking the pool ([a78a151](https://github.com/dehydr8/cproxy/commit/a78a151118b6623aed64cf697ecce8b3eeb67e1f))
+* wait for the rejected window's reset, up to 7 days, with jitter ([a78a151](https://github.com/dehydr8/cproxy/commit/a78a151118b6623aed64cf697ecce8b3eeb67e1f))
+
 ## [1.10.1](https://github.com/dehydr8/cproxy/compare/v1.10.0...v1.10.1) (2026-10-29)
 
 
