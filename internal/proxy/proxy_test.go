@@ -326,13 +326,24 @@ func TestRateLimitCooldown(t *testing.T) {
 		headers map[string]string
 		min     time.Duration // cooldown bounds, from now
 		max     time.Duration
-		exactly *time.Time
 	}{
 		{
-			// Subscription exhausted: no Retry-After, only the unified reset.
+			// Subscription exhausted: no Retry-After, only the unified reset
+			// (plus up to resetJitter).
 			name:    "exhausted subscription waits for its reset",
 			headers: map[string]string{"Anthropic-Ratelimit-Unified-Status": "rejected", "Anthropic-Ratelimit-Unified-Reset": epoch},
-			exactly: &reset,
+			min:     time.Until(reset) - 2*time.Second, max: time.Until(reset) + resetJitter + 2*time.Second,
+		},
+		{
+			// A spent shared window benches the account until that window
+			// resets, even past 24 hours.
+			name: "spent 7-day window waits for its reset",
+			headers: map[string]string{
+				"Anthropic-Ratelimit-Unified-Status":    "rejected",
+				"Anthropic-Ratelimit-Unified-7d-Status": "rejected",
+				"Anthropic-Ratelimit-Unified-7d-Reset":  strconv.FormatInt(time.Now().Add(5*24*time.Hour).Unix(), 10),
+			},
+			min: 5*24*time.Hour - 2*time.Second, max: 5*24*time.Hour + resetJitter + 2*time.Second,
 		},
 		{
 			// The reset is sent on every response; a 429 that is not the
@@ -368,12 +379,6 @@ func TestRateLimitCooldown(t *testing.T) {
 				t.Fatalf("got %d, want 429", resp.StatusCode)
 			}
 			got := sel.StatsSnapshot([]string{"a"})["a"].CoolingUntil
-			if tc.exactly != nil {
-				if !got.Equal(*tc.exactly) {
-					t.Fatalf("cooling until %v, want %v", got, *tc.exactly)
-				}
-				return
-			}
 			if d := time.Until(got); d < tc.min || d > tc.max {
 				t.Fatalf("cooldown %v, want between %v and %v", d.Round(time.Second), tc.min, tc.max)
 			}

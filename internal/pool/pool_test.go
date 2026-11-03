@@ -17,7 +17,7 @@ func accounts(names ...string) []Account {
 
 func head(t *testing.T, s *Selector, m []Account, strategy Strategy, pool, client string) Account {
 	t.Helper()
-	got := s.Ranked(m, strategy, pool, client)
+	got := s.Ranked(m, strategy, Route{Pool: pool, Client: client})
 	if len(got) == 0 {
 		t.Fatalf("ranked returned no accounts for client %q", client)
 	}
@@ -85,7 +85,7 @@ func TestRankedAllUnavailable(t *testing.T) {
 	m := accounts("a", "b")
 	s.MarkRateLimited("a", time.Now().Add(time.Hour))
 	s.MarkRateLimited("b", time.Now().Add(time.Hour))
-	if got := s.Ranked(m, StrategySticky, "p", "c"); got != nil {
+	if got := s.Ranked(m, StrategySticky, Route{Pool: "p", Client: "c"}); got != nil {
 		t.Fatalf("ranked returned %v, want nil", got)
 	}
 }
@@ -115,7 +115,7 @@ func TestRandomReturnsPermutation(t *testing.T) {
 	m := accounts("a", "b", "c")
 	want := []string{"a", "b", "c"}
 	for i := 0; i < 25; i++ {
-		got := s.Ranked(m, StrategyRandom, "p", "c")
+		got := s.Ranked(m, StrategyRandom, Route{Pool: "p", Client: "c"})
 		names := make([]string, len(got))
 		for j, a := range got {
 			names[j] = a.Name
@@ -130,7 +130,7 @@ func TestRandomReturnsPermutation(t *testing.T) {
 func TestDisabledExcluded(t *testing.T) {
 	s := NewSelector()
 	m := []Account{{Name: "a", Token: "t", Disabled: true}, {Name: "b", Token: "t"}}
-	got := s.Ranked(m, StrategySticky, "p", "c")
+	got := s.Ranked(m, StrategySticky, Route{Pool: "p", Client: "c"})
 	if len(got) != 1 || got[0].Name != "b" {
 		t.Fatalf("ranked = %v, want [b]", got)
 	}
@@ -141,7 +141,7 @@ func TestNextRecoveryEarliest(t *testing.T) {
 	m := accounts("a", "b")
 	s.MarkRateLimited("a", time.Now().Add(2*time.Hour))
 	s.MarkRateLimited("b", time.Now().Add(20*time.Millisecond))
-	got := s.NextRecovery(m)
+	got := s.NextRecovery(m, "")
 	if got.IsZero() {
 		t.Fatal("next recovery is zero")
 	}
@@ -149,7 +149,7 @@ func TestNextRecoveryEarliest(t *testing.T) {
 		t.Fatalf("next recovery = %v, want ~20ms", d)
 	}
 	time.Sleep(30 * time.Millisecond) // b's cooldown expires
-	if d := time.Until(s.NextRecovery(m)); d < 59*time.Minute {
+	if d := time.Until(s.NextRecovery(m, "")); d < 59*time.Minute {
 		t.Fatalf("expired cooldown still counted: %v", d)
 	}
 }
@@ -159,7 +159,7 @@ func TestMarkRateLimitedKeepsLonger(t *testing.T) {
 	long := time.Now().Add(time.Hour)
 	s.MarkRateLimited("a", long)
 	s.MarkRateLimited("a", time.Now().Add(time.Minute))
-	if got := s.NextRecovery(accounts("a")); !got.Equal(long) {
+	if got := s.NextRecovery(accounts("a"), ""); !got.Equal(long) {
 		t.Fatalf("cooldown was shortened: %v, want %v", got, long)
 	}
 }
@@ -233,13 +233,14 @@ func TestStatsSnapshots(t *testing.T) {
 	}
 
 	// StickySnapshot is a copy: mutating it must not affect the selector.
-	sel.Ranked(accounts("a"), StrategySticky, "p", "alice")
+	alice := Route{Pool: "p", Client: "alice"}
+	sel.Ranked(accounts("a"), StrategySticky, alice)
 	snap := sel.StickySnapshot()
-	if snap["p|alice"] != "a" {
-		t.Fatalf("sticky snapshot = %v", snap)
+	if len(snap) != 1 || snap[0].PinKey != alice.key() || snap[0].Account != "a" {
+		t.Fatalf("sticky snapshot = %+v", snap)
 	}
-	snap["p|alice"] = "hacked"
-	if got := sel.Assignment("p", "alice"); got != "a" {
+	snap[0].Account = "hacked"
+	if got := sel.Assignment(alice); got != "a" {
 		t.Fatalf("sticky snapshot is not a copy: assignment = %q", got)
 	}
 }
@@ -297,7 +298,7 @@ func TestStickyMovesBeforeTheLimit(t *testing.T) {
 	if got := head(t, s, m, StrategySticky, "p", "c1"); got.Name != "c" {
 		t.Fatalf("at 91%% moved to %q, want c (most headroom)", got.Name)
 	}
-	if why := s.SwitchReason("p", "c1"); !strings.Contains(why, "a at 91%") || !strings.Contains(why, "c at 25%") {
+	if why := s.SwitchReason(Route{Pool: "p", Client: "c1"}); !strings.Contains(why, "a at 91%") || !strings.Contains(why, "c at 25%") {
 		t.Fatalf("switch reason = %q", why)
 	}
 	// Within the cooldown it stays put even if c fills up too.
@@ -341,5 +342,62 @@ func TestStickyNewPinsTakeMostHeadroom(t *testing.T) {
 	seen(s, "c", 30, 30)
 	if got := head(t, s, m, StrategySticky, "p", "new"); got.Name != "b" {
 		t.Fatalf("new client pinned to %q, want b (most headroom)", got.Name)
+	}
+}
+
+func TestSuccessDoesNotLiftCooldown(t *testing.T) {
+	// A request already in flight when its account hit a limit can still
+	// succeed; that must not lift the limit.
+	s := NewSelector()
+	until := time.Now().Add(time.Hour)
+	s.MarkRateLimited("a", until)
+	s.MarkSuccess("a")
+	if got := s.StatsSnapshot([]string{"a"})["a"].CoolingUntil; !got.Equal(until) {
+		t.Fatalf("cooling until %v after a success, want %v", got, until)
+	}
+}
+
+func TestModelCooldownSkipsOnlyThatModel(t *testing.T) {
+	s := NewSelector()
+	m := accounts("a", "b")
+	s.MarkModelRateLimited("a", "opus", time.Now().Add(time.Hour))
+	if got := s.Ranked(m, StrategyRoundRobin, Route{Pool: "p", Model: "opus"}); len(got) != 1 || got[0].Name != "b" {
+		t.Fatalf("opus candidates = %v, want only b", got)
+	}
+	if got := s.Ranked(m, StrategyRoundRobin, Route{Pool: "p", Model: "sonnet"}); len(got) != 2 {
+		t.Fatalf("sonnet candidates = %v, want both", got)
+	}
+	s.MarkModelRateLimited("b", "opus", time.Now().Add(2*time.Hour))
+	if d := time.Until(s.NextRecovery(m, "opus")); d < 59*time.Minute || d > time.Hour {
+		t.Fatalf("opus recovers in %v, want ~1h", d)
+	}
+	if got := s.NextRecovery(m, "sonnet"); !got.IsZero() {
+		t.Fatalf("sonnet recovery = %v, want none", got)
+	}
+}
+
+func TestSessionPinsExpireAndForget(t *testing.T) {
+	s := NewSelector()
+	m := accounts("a", "b")
+	old := Route{Pool: "p", Client: "c", Session: "old"}
+	cur := Route{Pool: "p", Client: "c", Session: "cur"}
+	client := Route{Pool: "p", Client: "c"}
+	s.Pin(old, "b")
+	s.Pin(client, "b")
+	s.pinSeen[old.key()] = time.Now().Add(-SessionTTL - time.Minute)
+	s.pinSeen[client.key()] = time.Now().Add(-SessionTTL - time.Minute)
+	s.Ranked(m, StrategySticky, cur)
+	if got := s.Assignment(old); got != "" {
+		t.Fatalf("idle session still pinned to %q", got)
+	}
+	if got := s.Assignment(client); got != "b" {
+		t.Fatalf("client pin dropped (%q); only session pins expire", got)
+	}
+	if got := s.Assignment(cur); got == "" {
+		t.Fatal("new session not pinned")
+	}
+	s.ForgetClient("c")
+	if snap := s.StickySnapshot(); len(snap) != 0 {
+		t.Fatalf("pins left after ForgetClient: %+v", snap)
 	}
 }

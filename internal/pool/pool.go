@@ -54,11 +54,11 @@ func MaskToken(tok string) string {
 type Strategy string
 
 const (
-	// StrategySticky pins each client (a run-mode session or a serve-mode
-	// client token) to one account and only moves it when that account is
-	// rate-limited or rejected. It is the default: a conversation that stays
-	// on one account pays its full context there exactly once, instead of
-	// every pool member paying for the same context.
+	// StrategySticky pins each Claude Code session (or, for requests
+	// without a session id, each client) to one account and only moves it
+	// when that account is rate-limited or rejected. It is the default: a
+	// conversation that stays on one account pays its full context there
+	// exactly once, instead of every pool member paying for the same context.
 	StrategySticky Strategy = "sticky"
 	// StrategyRoundRobin rotates across members on every request.
 	StrategyRoundRobin Strategy = "round-robin"
@@ -94,6 +94,33 @@ func ParseStrategy(s string) (Strategy, error) {
 // Strategies returns the accepted strategy names for help text.
 func Strategies() string { return strings.Join(allStrategies, ", ") }
 
+// SessionTTL is how long an idle session keeps its pin. It matches the
+// longest prompt cache TTL: once a session has been idle that long its cache
+// is gone, so moving it costs nothing.
+const SessionTTL = time.Hour
+
+// Route says who a request is for: the pool and client it came through,
+// the Claude Code session it belongs to (X-Claude-Code-Session-Id; empty
+// for other clients) and the model it asks for (empty when unknown).
+type Route struct {
+	Pool, Client, Session, Model string
+}
+
+// PinKey identifies one sticky pin: a session of a client, or the client
+// itself when its requests carry no session id.
+type PinKey struct {
+	Pool, Client, Session string
+}
+
+func (r Route) key() PinKey { return PinKey{r.Pool, r.Client, r.Session} }
+
+// Pin is one sticky assignment, for the usage page.
+type Pin struct {
+	PinKey
+	Account string
+	Seen    time.Time // last request routed through it
+}
+
 // Selector tracks sticky assignments, request counters and per-account health
 // for the pools served by one proxy process. All methods are safe for
 // concurrent use; health state survives serve-mode config reloads.
@@ -102,22 +129,25 @@ type Selector struct {
 	rr          map[string]int       // pool -> round-robin cursor for new assignments
 	served      map[string]int64     // account -> requests served
 	rateLimited map[string]int64     // account -> 429 responses seen
-	rejected    map[string]int64     // account -> 401 responses seen
+	rejected    map[string]int64     // account -> 401 and 403 responses seen
 	upstreamErr map[string]int64     // account -> transport errors seen
 	lastUsed    map[string]time.Time // account -> last request served
 	clientReq   map[string]int64     // client -> accepted requests
 	clientLast  map[string]time.Time // client -> last accepted request
 	rateLimits  map[string]*RateLimitInfo
-	sticky      map[string]string     // pool|client -> account name
-	cooldown    map[string]time.Time  // account -> rate-limited until
-	invalid     map[string]bool       // account -> token rejected upstream (401)
-	inFlight    map[string]int64      // account -> upstream requests open right now
-	clientLive  map[string]int64      // client -> requests open right now
-	tokens      map[string]TokenUsage // account -> tokens served
-	clientTok   map[string]TokenUsage // client -> tokens used
-	apiUsage    map[string]windows    // account -> last usage API utilization
-	lastSwitch  map[string]time.Time  // pool|client -> last proactive move
-	switchWhy   map[string]string     // pool|client -> why it last moved
+	sticky      map[PinKey]string               // pin -> account name
+	pinSeen     map[PinKey]time.Time            // pin -> last request routed through it
+	lastPrune   time.Time                       // last sweep of idle session pins
+	cooldown    map[string]time.Time            // account -> rate-limited until
+	modelCool   map[string]map[string]time.Time // account -> model -> rate-limited until
+	invalid     map[string]bool                 // account -> token rejected upstream (401)
+	inFlight    map[string]int64                // account -> upstream requests open right now
+	clientLive  map[string]int64                // client -> requests open right now
+	tokens      map[string]TokenUsage           // account -> tokens served
+	clientTok   map[string]TokenUsage           // client -> tokens used
+	apiUsage    map[string]windows              // account -> last usage API utilization
+	lastSwitch  map[PinKey]time.Time            // pin -> last proactive move
+	switchWhy   map[PinKey]string               // pin -> why it last moved
 	policy      SwitchPolicy
 }
 
@@ -222,11 +252,11 @@ func (s *Selector) mostHeadroom(avail []Account, skip string, limit float64, now
 	return pick, pickPct, found
 }
 
-// SwitchReason says why a client's sticky pin last moved.
-func (s *Selector) SwitchReason(poolName, clientID string) string {
+// SwitchReason says why a route's sticky pin last moved.
+func (s *Selector) SwitchReason(r Route) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if r := s.switchWhy[poolName+"|"+clientID]; r != "" {
+	if r := s.switchWhy[r.key()]; r != "" {
 		return r
 	}
 	return "previous account unavailable"
@@ -269,28 +299,32 @@ func NewSelector() *Selector {
 		clientReq:   map[string]int64{},
 		clientLast:  map[string]time.Time{},
 		rateLimits:  map[string]*RateLimitInfo{},
-		sticky:      map[string]string{},
+		sticky:      map[PinKey]string{},
+		pinSeen:     map[PinKey]time.Time{},
 		cooldown:    map[string]time.Time{},
+		modelCool:   map[string]map[string]time.Time{},
 		invalid:     map[string]bool{},
 		inFlight:    map[string]int64{},
 		clientLive:  map[string]int64{},
 		tokens:      map[string]TokenUsage{},
 		clientTok:   map[string]TokenUsage{},
 		apiUsage:    map[string]windows{},
-		lastSwitch:  map[string]time.Time{},
-		switchWhy:   map[string]string{},
+		lastSwitch:  map[PinKey]time.Time{},
+		switchWhy:   map[PinKey]string{},
 		policy:      DefaultSwitchPolicy,
 	}
 }
 
 // Ranked returns the pool's usable members ordered best-first for this
-// request. Disabled, cooling-down and rejected members are dropped.
-// clientID keys the sticky strategy; new clients are assigned round-robin.
-func (s *Selector) Ranked(members []Account, strategy Strategy, poolName, clientID string) []Account {
+// request. Disabled, cooling-down and rejected members are dropped, and so
+// are members cooling down for the route's model. The route's session (or,
+// without one, its client) keys the sticky strategy.
+func (s *Selector) Ranked(members []Account, strategy Strategy, r Route) []Account {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	now := time.Now()
+	s.pruneSessions(now)
 	avail := make([]Account, 0, len(members))
 	for _, m := range members {
 		if m.Disabled || s.invalid[m.Name] {
@@ -302,8 +336,15 @@ func (s *Selector) Ranked(members []Account, strategy Strategy, poolName, client
 			}
 			delete(s.cooldown, m.Name) // expired
 		}
+		if until, ok := s.modelCool[m.Name][r.Model]; ok && r.Model != "" {
+			if until.After(now) {
+				continue
+			}
+			delete(s.modelCool[m.Name], r.Model)
+		}
 		avail = append(avail, m)
 	}
+	poolName := r.Pool
 	if len(avail) == 0 {
 		return nil
 	}
@@ -325,7 +366,8 @@ func (s *Selector) Ranked(members []Account, strategy Strategy, poolName, client
 		return sh
 
 	default: // StrategySticky
-		key := poolName + "|" + clientID
+		key := r.key()
+		s.pinSeen[key] = now
 		p := s.policy
 		if want := s.sticky[key]; want != "" {
 			if i := slices.IndexFunc(avail, func(a Account) bool { return a.Name == want }); i >= 0 {
@@ -361,6 +403,29 @@ func (s *Selector) Ranked(members []Account, strategy Strategy, poolName, client
 	}
 }
 
+// pruneSessions drops session pins idle for longer than SessionTTL, at most
+// once a minute. Client pins (no session) are kept. The caller must hold
+// s.mu.
+func (s *Selector) pruneSessions(now time.Time) {
+	if now.Sub(s.lastPrune) < time.Minute {
+		return
+	}
+	s.lastPrune = now
+	for key, seen := range s.pinSeen {
+		if key.Session != "" && now.Sub(seen) > SessionTTL {
+			s.dropPin(key)
+		}
+	}
+}
+
+// dropPin forgets one pin. The caller must hold s.mu.
+func (s *Selector) dropPin(key PinKey) {
+	delete(s.sticky, key)
+	delete(s.pinSeen, key)
+	delete(s.lastSwitch, key)
+	delete(s.switchWhy, key)
+}
+
 // anyKnown reports whether any of avail has utilization data. The caller
 // must hold s.mu.
 func (s *Selector) anyKnown(avail []Account, now time.Time) bool {
@@ -383,28 +448,30 @@ func (s *Selector) rotate(poolName string, members []Account) []Account {
 	return append(slices.Clone(members[i:]), members[:i]...)
 }
 
-// Assignment returns the account a client is currently pinned to, or "".
-func (s *Selector) Assignment(poolName, clientID string) string {
+// Assignment returns the account a route is currently pinned to, or "".
+func (s *Selector) Assignment(r Route) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.sticky[poolName+"|"+clientID]
+	return s.sticky[r.key()]
 }
 
-// Pin moves a client's sticky assignment to account, e.g. after a failover
+// Pin moves a route's sticky assignment to account, e.g. after a failover
 // landed its request there.
-func (s *Selector) Pin(poolName, clientID, account string) {
+func (s *Selector) Pin(r Route, account string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.sticky[poolName+"|"+clientID] = account
+	s.sticky[r.key()] = account
+	s.pinSeen[r.key()] = time.Now()
 }
 
-// MarkSuccess records a completed upstream request.
+// MarkSuccess records a completed upstream request. It leaves cooldowns
+// alone: a request that was already in flight when its account was
+// rate-limited can still succeed, and must not lift the limit.
 func (s *Selector) MarkSuccess(name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.served[name]++
 	s.lastUsed[name] = time.Now()
-	delete(s.cooldown, name)
 }
 
 // MarkRateLimited records a 429 response and puts an account on cooldown
@@ -413,6 +480,36 @@ func (s *Selector) MarkRateLimited(name string, until time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rateLimited[name]++
+	if cur, ok := s.cooldown[name]; !ok || until.After(cur) {
+		s.cooldown[name] = until
+	}
+}
+
+// MarkModelRateLimited records a 429 that limits only one model on an
+// account (a per-model weekly limit, or extra usage running out while the
+// subscription windows still have room): the account keeps serving other
+// models, and this model is skipped on it until t.
+func (s *Selector) MarkModelRateLimited(name, model string, until time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rateLimited[name]++
+	m := s.modelCool[name]
+	if m == nil {
+		m = map[string]time.Time{}
+		s.modelCool[name] = m
+	}
+	if cur, ok := m[model]; !ok || until.After(cur) {
+		m[model] = until
+	}
+}
+
+// MarkForbidden records a 403 for an account that another account then
+// served, and puts it on cooldown until t: a disabled organization or a
+// revoked grant, which a reload with a new token (ClearAccount) lifts.
+func (s *Selector) MarkForbidden(name string, until time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rejected[name]++
 	if cur, ok := s.cooldown[name]; !ok || until.After(cur) {
 		s.cooldown[name] = until
 	}
@@ -480,8 +577,8 @@ func (s *Selector) ForgetClient(client string) {
 	delete(s.clientLive, client)
 	delete(s.clientTok, client)
 	for key := range s.sticky {
-		if strings.HasSuffix(key, "|"+client) {
-			delete(s.sticky, key)
+		if key.Client == client {
+			s.dropPin(key)
 		}
 	}
 }
@@ -511,6 +608,7 @@ type AccountStats struct {
 	Errors       int64
 	LastUsed     time.Time
 	CoolingUntil time.Time
+	ModelCooling map[string]time.Time // model -> cooling until, for models limited on their own
 	Invalid      bool
 	InFlight     int64 // upstream requests open right now
 	Tokens       TokenUsage
@@ -562,8 +660,18 @@ func (s *Selector) MarkRateLimits(name string, info RateLimitInfo) {
 func (s *Selector) StatsSnapshot(names []string) map[string]AccountStats {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 	out := make(map[string]AccountStats, len(names))
 	for _, n := range names {
+		var models map[string]time.Time
+		for model, until := range s.modelCool[n] {
+			if until.After(now) {
+				if models == nil {
+					models = map[string]time.Time{}
+				}
+				models[model] = until
+			}
+		}
 		out[n] = AccountStats{
 			Requests:     s.served[n],
 			RateLimited:  s.rateLimited[n],
@@ -571,6 +679,7 @@ func (s *Selector) StatsSnapshot(names []string) map[string]AccountStats {
 			Errors:       s.upstreamErr[n],
 			LastUsed:     s.lastUsed[n],
 			CoolingUntil: s.cooldown[n],
+			ModelCooling: models,
 			Invalid:      s.invalid[n],
 			InFlight:     s.inFlight[n],
 			Tokens:       s.tokens[n],
@@ -592,15 +701,16 @@ func (s *Selector) ClientStatsSnapshot() map[string]ClientStats {
 	return out
 }
 
-// StickySnapshot returns a copy of the current sticky assignments
-// (pool|client -> account name).
-func (s *Selector) StickySnapshot() map[string]string {
+// StickySnapshot returns the current sticky assignments, most recently
+// used first.
+func (s *Selector) StickySnapshot() []Pin {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make(map[string]string, len(s.sticky))
+	out := make([]Pin, 0, len(s.sticky))
 	for k, v := range s.sticky {
-		out[k] = v
+		out = append(out, Pin{k, v, s.pinSeen[k]})
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Seen.After(out[j].Seen) })
 	return out
 }
 
@@ -611,21 +721,27 @@ func (s *Selector) ClearAccount(name string) {
 	defer s.mu.Unlock()
 	delete(s.invalid, name)
 	delete(s.cooldown, name)
+	delete(s.modelCool, name)
 	delete(s.rateLimits, name)
 }
 
 // NextRecovery returns the earliest time a currently-cooling member becomes
-// usable again, or the zero time if none.
-func (s *Selector) NextRecovery(members []Account) time.Time {
+// usable again for model (empty: any model), or the zero time if none.
+func (s *Selector) NextRecovery(members []Account, model string) time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
 	var best time.Time
 	for _, m := range members {
-		if until, ok := s.cooldown[m.Name]; ok && until.After(now) {
-			if best.IsZero() || until.Before(best) {
-				best = until
-			}
+		if m.Disabled || s.invalid[m.Name] {
+			continue
+		}
+		until := s.cooldown[m.Name]
+		if mu := s.modelCool[m.Name][model]; model != "" && mu.After(until) {
+			until = mu
+		}
+		if until.After(now) && (best.IsZero() || until.Before(best)) {
+			best = until
 		}
 	}
 	return best

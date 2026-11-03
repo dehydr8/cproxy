@@ -1,5 +1,5 @@
 // Package proxy implements the Anthropic-compatible reverse proxy: client
-// authentication, upstream credential rewriting, sticky per-client account
+// authentication, upstream credential rewriting, sticky per-session account
 // assignment and transparent rate-limit failover.
 package proxy
 
@@ -301,22 +301,29 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 	}
 
 	pn := st.Runtime.PoolFor(ca)
-	// Read the pin before Ranked, which remaps a client whose pinned account
+	route := pool.Route{
+		Pool:    pn,
+		Client:  ca.Name,
+		Session: strings.TrimSpace(r.Header.Get("X-Claude-Code-Session-Id")),
+		Model:   requestModel(body),
+	}
+	// Read the pin before Ranked, which remaps a route whose pinned account
 	// became unavailable.
-	prev := s.sel.Assignment(pn, ca.Name)
-	ranked := s.sel.Ranked(members, strategy, pn, ca.Name)
+	prev := s.sel.Assignment(route)
+	ranked := s.sel.Ranked(members, strategy, route)
 	if len(ranked) == 0 {
-		s.rejectAllUnavailable(w, members, pn, ca)
+		s.rejectAllUnavailable(w, members, route, ca)
 		return
 	}
 	if prev != "" && prev != ranked[0].Name {
-		s.log.Warn("switching account", "client", ca.Name, "pool", pn,
-			"from", prev, "to", ranked[0].Name, "reason", s.sel.SwitchReason(pn, ca.Name))
+		s.log.Warn("switching account", "client", ca.Name, "pool", pn, "session", route.Session,
+			"from", prev, "to", ranked[0].Name, "reason", s.sel.SwitchReason(route))
 	}
 
 	rec := &recorder{ResponseWriter: w, status: http.StatusOK}
 	var held *heldResponse
 	var lastErr error
+	var forbidden []string // accounts that answered 403; benched once another serves the request
 	// Each attempt counts as in flight on its account until it is done; the
 	// deferred sweep covers every exit (the end funcs are idempotent).
 	var ends []func()
@@ -368,40 +375,65 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 			end()
 			continue
 		}
-		if resp.StatusCode == http.StatusTooManyRequests && !isRateLimit(resp.Header) {
-			// A refusal of this request, not a limit on the account: try the
-			// others (an API-key member may serve it) without benching any.
-			s.log.Info("upstream refused the request with a bare 429; not benching the account",
-				"account", acct.Name, "can_retry", replay)
-			if !replay {
-				s.copyResponse(rec, resp, nil)
-				s.logDone(r, rec, ca, pn, acct.Name, start)
-				return
-			}
+		if resp.StatusCode == http.StatusForbidden {
+			// A disabled organization or revoked grant fails only on this
+			// account, while a request no account may make fails on all of
+			// them: try the others, and bench this one only if another then
+			// serves the request.
+			s.log.Warn("upstream refused the account (403)", "account", acct.Name, "can_retry", replay)
 			held = captureHeld(resp)
 			end()
+			if !replay {
+				break
+			}
+			forbidden = append(forbidden, acct.Name)
 			continue
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
-			until := rateLimitedUntil(resp)
-			s.sel.MarkRateLimited(acct.Name, until)
-			s.log.Warn("account rate limited", "account", acct.Name,
-				"cooldown", until.Sub(time.Now()).Round(time.Second), "can_retry", replay)
-			if !replay {
-				s.copyResponse(rec, resp, nil)
-				s.logDone(r, rec, ca, pn, acct.Name, start)
-				return
-			}
 			held = captureHeld(resp)
 			end()
+			scope, until := classify429(held.header, held.body, time.Now())
+			if scope == limitModel && route.Model == "" {
+				scope = limitAccount // no model to limit (an unreplayable body)
+			}
+			switch scope {
+			case limitFast:
+				s.log.Info("fast mode refused for want of usage credits; passing it to the client",
+					"account", acct.Name)
+				s.writeHeld(rec, held)
+				s.logDone(r, rec, ca, pn, acct.Name, start)
+				return
+			case limitRequest:
+				// A refusal of this request, not a limit on the account: try
+				// the others (an API-key member may serve it) without benching
+				// any.
+				s.log.Info("upstream refused the request with a bare 429; not benching the account",
+					"account", acct.Name, "can_retry", replay)
+			case limitModel:
+				s.sel.MarkModelRateLimited(acct.Name, route.Model, until)
+				s.log.Warn("model rate limited on account", "account", acct.Name, "model", route.Model,
+					"cooldown", time.Until(until).Round(time.Second), "can_retry", replay)
+			default:
+				s.sel.MarkRateLimited(acct.Name, until)
+				s.log.Warn("account rate limited", "account", acct.Name,
+					"cooldown", time.Until(until).Round(time.Second), "can_retry", replay)
+			}
+			if !replay {
+				break
+			}
 			continue
 		}
 
 		s.sel.MarkSuccess(acct.Name)
+		for _, name := range forbidden {
+			s.sel.MarkForbidden(name, time.Now().Add(forbiddenCooldown))
+			s.log.Warn("account benched after a 403 another account did not get", "account", name,
+				"cooldown", forbiddenCooldown)
+		}
 		if strategy == pool.StrategySticky && acct.Name != ranked[0].Name {
-			// Failed over: keep the client on the account that now holds its
+			// Failed over: keep the route on the account that now holds its
 			// conversation instead of remapping it again next request.
-			s.sel.Pin(pn, ca.Name, acct.Name)
+			s.sel.Pin(route, acct.Name)
 		}
 		var onUsage func(pool.TokenUsage)
 		if strings.HasSuffix(r.URL.Path, "/v1/messages") {
@@ -414,7 +446,8 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, usage, api bool) 
 	}
 
 	if held != nil {
-		// Every usable account was tried; surface the last upstream 429.
+		// Every usable account was tried (or the body could not be resent);
+		// surface the last upstream 429 or 403.
 		s.writeHeld(rec, held)
 		s.logDone(r, rec, ca, pn, "exhausted", start)
 		return
@@ -597,92 +630,6 @@ func drainClose(resp *http.Response) {
 	resp.Body.Close()
 }
 
-// retryAfter parses Retry-After (delta-seconds or HTTP-date), falling back to
-// def. Cooldowns are capped at 24h.
-func retryAfter(resp *http.Response, def time.Duration) time.Time {
-	now := time.Now()
-	v := strings.TrimSpace(resp.Header.Get("Retry-After"))
-	if v == "" {
-		return now.Add(def)
-	}
-	if secs, err := strconv.Atoi(v); err == nil {
-		if secs < 0 {
-			secs = 0
-		}
-		if secs > 86400 {
-			secs = 86400
-		}
-		return now.Add(time.Duration(secs) * time.Second)
-	}
-	if t, err := http.ParseTime(v); err == nil {
-		if t.Before(now) {
-			return now
-		}
-		if t.After(now.Add(24 * time.Hour)) {
-			return now.Add(24 * time.Hour)
-		}
-		return t
-	}
-	return now.Add(def)
-}
-
-// isRateLimit reports whether a 429 is an actual rate limit, i.e. carries
-// Retry-After or anthropic-ratelimit-* headers. OAuth tokens also get a bare
-// 429 (rate_limit_error "Error", neither header) for requests Anthropic will
-// not serve on them, such as ones without Claude Code's system prompt; that
-// says nothing about the account, which keeps serving normal requests.
-func isRateLimit(h http.Header) bool {
-	if strings.TrimSpace(h.Get("Retry-After")) != "" {
-		return true
-	}
-	for k := range h {
-		if strings.HasPrefix(http.CanonicalHeaderKey(k), "Anthropic-Ratelimit-") {
-			return true
-		}
-	}
-	return false
-}
-
-// Cooldowns after a 429.
-const (
-	// exhaustedCooldown applies when the subscription reports itself
-	// exhausted but sends no reset time.
-	exhaustedCooldown = 10 * time.Minute
-	// briefCooldown applies to any other 429 without Retry-After: a
-	// short-term or request-specific limit says little about the account,
-	// so it must not bench it for long.
-	briefCooldown = 30 * time.Second
-)
-
-// rateLimitedUntil decides how long a 429'd account cools down:
-//
-//   - the subscription itself is exhausted (unified-status "rejected"):
-//     until anthropic-ratelimit-unified-reset, else Retry-After, else
-//     exhaustedCooldown;
-//   - any other 429: Retry-After when present, else briefCooldown.
-//
-// Cooldowns are capped at 24h.
-func rateLimitedUntil(resp *http.Response) time.Time {
-	now := time.Now()
-	hasRetryAfter := strings.TrimSpace(resp.Header.Get("Retry-After")) != ""
-	if strings.EqualFold(strings.TrimSpace(resp.Header.Get("Anthropic-Ratelimit-Unified-Status")), "rejected") {
-		if t, ok := headerReset(resp.Header, "Anthropic-Ratelimit-Unified-Reset"); ok && t.After(now) {
-			if limit := now.Add(24 * time.Hour); t.After(limit) {
-				return limit
-			}
-			return t
-		}
-		if hasRetryAfter {
-			return retryAfter(resp, exhaustedCooldown)
-		}
-		return now.Add(exhaustedCooldown)
-	}
-	if hasRetryAfter {
-		return retryAfter(resp, briefCooldown)
-	}
-	return now.Add(briefCooldown)
-}
-
 // parseRateLimits extracts an Anthropic rate-limit snapshot from response
 // headers, returning nil when the upstream sent no rate-limit headers.
 func parseRateLimits(h http.Header) *pool.RateLimitInfo {
@@ -776,8 +723,9 @@ func headerReset(h http.Header, key string) (time.Time, bool) {
 
 // rejectAllUnavailable answers with an Anthropic-style 429 when every pool
 // member is cooling down or invalid, so Claude's native retry UX kicks in.
-func (s *Server) rejectAllUnavailable(w http.ResponseWriter, members []pool.Account, pn string, ca config.ClientAuth) {
-	until := s.sel.NextRecovery(members)
+func (s *Server) rejectAllUnavailable(w http.ResponseWriter, members []pool.Account, route pool.Route, ca config.ClientAuth) {
+	pn := route.Pool
+	until := s.sel.NextRecovery(members, route.Model)
 	if until.IsZero() {
 		writeError(w, http.StatusTooManyRequests, "rate_limit_error",
 			fmt.Sprintf("cproxy: every account in pool %q has a rejected (invalid) token; check `cproxy accounts list`", pn))

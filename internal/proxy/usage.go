@@ -24,32 +24,34 @@ import (
 )
 
 type accountRow struct {
-	Name        string
-	Email       string // from the profile API when the token may read it
-	Org         string
-	Plan        string // "Max 20x", "Team · 5x"
-	Initials    string
-	Hue         int
-	Type        string
-	Pools       []string
-	Token       string // masked
-	Requests    int64
-	RateLimited int64
-	Rejected    int64
-	Errors      int64
-	State       string // available / cooling 4m / invalid token / disabled
-	Tone        string // badge tone: ok, warn, danger or "" (neutral)
-	Meters      []meter
-	Spend       string
-	UsageNote   string // why there are no usage API numbers
-	HeaderNote  string // fallback: last anthropic-ratelimit-* headers
-	LastUsed    string
-	LastUsedAt  string // RFC3339, for the tooltip
-	InFlight    int64  // requests streaming through it right now
-	PinnedBy    string // clients pinned to it, e.g. "amp-thread-1, osama +2"
-	PinnedAll   string // every pinned client, for the tooltip
-	Tokens      string // "1.2M in · 34k out"
-	TokensTitle string // cache breakdown
+	Name         string
+	Email        string // from the profile API when the token may read it
+	Org          string
+	Plan         string // "Max 20x", "Team · 5x"
+	Initials     string
+	Hue          int
+	Type         string
+	Pools        []string
+	Token        string // masked
+	Requests     int64
+	RateLimited  int64
+	Rejected     int64
+	Errors       int64
+	State        string // available / cooling 4m / invalid token / disabled
+	Tone         string // badge tone: ok, warn, danger or "" (neutral)
+	Meters       []meter
+	Spend        string
+	UsageNote    string // why there are no usage API numbers
+	HeaderNote   string // fallback: last anthropic-ratelimit-* headers
+	LastUsed     string
+	LastUsedAt   string // RFC3339, for the tooltip
+	InFlight     int64  // requests streaming through it right now
+	PinnedBy     string // clients pinned to it, e.g. "amp-thread-1, osama +2"
+	PinnedAll    string // every pinned client, for the tooltip
+	ModelCooling string // models limited on their own, e.g. "claude-opus-5-5 2d4h"
+	Sessions     int    // Claude Code sessions pinned to it
+	Tokens       string // "1.2M in · 34k out"
+	TokensTitle  string // cache breakdown
 }
 
 // meter is one utilization bar (5h, 7d, a per-model limit).
@@ -130,7 +132,8 @@ var usageTmpl = template.Must(template.New("usage").Parse(`
         <span class="identity-sub"{{if .Email}} title="{{.Email}}"{{end}}>{{if .Email}}{{.Email}}{{else}}{{.Type}} token{{end}}</span></span></span></td>
       <td><span class="badge{{if .Tone}} {{.Tone}}{{end}}">{{.State}}</span>
         {{if .InFlight}}<div class="state-sub"><span class="presence presence-live">{{.InFlight}} streaming</span></div>{{end}}
-        {{if .PinnedBy}}<div class="state-sub faint" title="pinned: {{.PinnedAll}}">for {{.PinnedBy}}</div>{{end}}</td>
+        {{if .ModelCooling}}<div class="state-sub" title="limited on this account until its reset">{{.ModelCooling}} cooling</div>{{end}}
+        {{if .PinnedBy}}<div class="state-sub faint" title="pinned: {{.PinnedAll}}">for {{.PinnedBy}}{{if .Sessions}} · {{.Sessions}} session{{if ne .Sessions 1}}s{{end}}{{end}}</div>{{end}}</td>
       <td class="fill usage">
         {{if .Meters}}<div class="meters">{{range .Meters}}
           <div class="meter"><div class="meter-top"><span>{{.Label}}</span><span class="meter-value {{.Tone}}">{{.Text}}</span></div>
@@ -306,16 +309,8 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 		names[i] = a.Name
 	}
 	stats := s.sel.StatsSnapshot(names)
-	sticky := s.sel.StickySnapshot()
+	pins := pinIndex(s.sel.StickySnapshot())
 	clientStats := s.sel.ClientStatsSnapshot()
-
-	// account -> clients pinned to it (pool|client -> account), sorted.
-	pinnedTo := map[string][]string{}
-	for key, acct := range sticky {
-		if _, client, ok := strings.Cut(key, "|"); ok && client != config.DashboardClientName {
-			pinnedTo[acct] = append(pinnedTo[acct], client)
-		}
-	}
 	var totalTok pool.TokenUsage
 
 	for _, a := range rt.Accounts {
@@ -337,7 +332,8 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 		}
 		row.InFlight = stt.InFlight
 		data.InFlight += stt.InFlight
-		row.PinnedBy, row.PinnedAll = pinnedSummary(pinnedTo[a.Name])
+		row.PinnedBy, row.PinnedAll = pinnedSummary(slices.Clone(pins.clients(a.Name)))
+		row.Sessions = pins.sessions[a.Name]
 		row.Tokens, row.TokensTitle = TokensLabel(stt.Tokens)
 		totalTok = totalTok.Add(stt.Tokens)
 		if prof := s.usage.profile(a.Name); prof != nil {
@@ -358,6 +354,7 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 			row.State, row.Tone = "available", "ok"
 			data.Available++
 		}
+		row.ModelCooling = modelCoolingLabel(stt.ModelCooling, now)
 		// Fresher response headers update the 5-hour and 7-day windows of
 		// the last usage reading; its per-model limits and spend stay.
 		u, fromHeaders := CurrentUsage(apiData, stt.RateLimits)
@@ -417,7 +414,7 @@ func (s *Server) usageData(st *State, tokParam string) usageData {
 		row := clientRow{
 			Name:     ca.Name,
 			Pool:     pn,
-			Pinned:   sticky[pn+"|"+ca.Name],
+			Pinned:   pins.accounts(pn, ca.Name),
 			Requests: cs.Requests,
 			LastSeen: ago(cs.LastSeen),
 			Active:   !cs.LastSeen.IsZero() && now.Sub(cs.LastSeen) < 2*time.Minute,
@@ -462,6 +459,55 @@ func (s *Server) clientList(st *State, seen map[string]pool.ClientStats) []confi
 		add(config.ClientAuth{Name: name})
 	}
 	return out
+}
+
+// pins indexes sticky pins for the usage page.
+type pins struct {
+	byAccount map[string][]string // account -> distinct clients pinned to it, sorted
+	sessions  map[string]int      // account -> session pins on it
+	byClient  map[string][]string // pool|client -> distinct accounts, most recently used first
+}
+
+func pinIndex(snap []pool.Pin) pins {
+	p := pins{map[string][]string{}, map[string]int{}, map[string][]string{}}
+	for _, pin := range snap { // most recently used first
+		if pin.Client == config.DashboardClientName {
+			continue
+		}
+		if !slices.Contains(p.byAccount[pin.Account], pin.Client) {
+			p.byAccount[pin.Account] = append(p.byAccount[pin.Account], pin.Client)
+		}
+		if pin.Session != "" {
+			p.sessions[pin.Account]++
+		}
+		ck := pin.Pool + "|" + pin.Client
+		if !slices.Contains(p.byClient[ck], pin.Account) {
+			p.byClient[ck] = append(p.byClient[ck], pin.Account)
+		}
+	}
+	for _, c := range p.byAccount {
+		slices.Sort(c)
+	}
+	return p
+}
+
+// clients returns the clients pinned to an account.
+func (p pins) clients(account string) []string { return p.byAccount[account] }
+
+// accounts renders the accounts a client's sessions are pinned to, most
+// recently used first.
+func (p pins) accounts(poolName, client string) string {
+	return strings.Join(p.byClient[poolName+"|"+client], ", ")
+}
+
+// modelCoolingLabel renders the models limited on their own on an account.
+func modelCoolingLabel(m map[string]time.Time, now time.Time) string {
+	parts := make([]string, 0, len(m))
+	for model, until := range m {
+		parts = append(parts, model+" "+humanDur(until.Sub(now)))
+	}
+	slices.Sort(parts)
+	return strings.Join(parts, ", ")
 }
 
 // pinnedSummary renders the clients pinned to an account: up to two names
@@ -577,28 +623,30 @@ type UsageSnapshot struct {
 }
 
 type UsageAccount struct {
-	Name         string              `json:"name"`
-	Email        string              `json:"email,omitempty"`        // from the profile API
-	Organization string              `json:"organization,omitempty"` // from the profile API
-	Plan         string              `json:"plan,omitempty"`         // from the profile API
-	Type         string              `json:"type"`
-	Pools        []string            `json:"pools"`
-	Token        string              `json:"token"` // masked
-	Requests     int64               `json:"requests"`
-	RateLimited  int64               `json:"rate_limited"`
-	Rejected     int64               `json:"rejected"`
-	Errors       int64               `json:"errors"`
-	State        string              `json:"state"`
-	LastUsed     *time.Time          `json:"last_used,omitempty"`
-	CoolingUntil *time.Time          `json:"cooling_until,omitempty"`
-	UsageAPI     *UsageAPI           `json:"usage_api,omitempty"`       // preferred: real usage API
-	UsageAPIErr  string              `json:"usage_api_error,omitempty"` // why the usage API is unavailable
-	RateLimits   *pool.RateLimitInfo `json:"rate_limits,omitempty"`     // fallback: inferred from headers
-	Invalid      bool                `json:"invalid,omitempty"`
-	Disabled     bool                `json:"disabled,omitempty"`
-	InFlight     int64               `json:"in_flight"`           // requests streaming right now
-	PinnedBy     []string            `json:"pinned_by,omitempty"` // clients pinned to it
-	Tokens       pool.TokenUsage     `json:"tokens"`
+	Name         string               `json:"name"`
+	Email        string               `json:"email,omitempty"`        // from the profile API
+	Organization string               `json:"organization,omitempty"` // from the profile API
+	Plan         string               `json:"plan,omitempty"`         // from the profile API
+	Type         string               `json:"type"`
+	Pools        []string             `json:"pools"`
+	Token        string               `json:"token"` // masked
+	Requests     int64                `json:"requests"`
+	RateLimited  int64                `json:"rate_limited"`
+	Rejected     int64                `json:"rejected"`
+	Errors       int64                `json:"errors"`
+	State        string               `json:"state"`
+	LastUsed     *time.Time           `json:"last_used,omitempty"`
+	CoolingUntil *time.Time           `json:"cooling_until,omitempty"`
+	UsageAPI     *UsageAPI            `json:"usage_api,omitempty"`       // preferred: real usage API
+	UsageAPIErr  string               `json:"usage_api_error,omitempty"` // why the usage API is unavailable
+	RateLimits   *pool.RateLimitInfo  `json:"rate_limits,omitempty"`     // fallback: inferred from headers
+	Invalid      bool                 `json:"invalid,omitempty"`
+	Disabled     bool                 `json:"disabled,omitempty"`
+	InFlight     int64                `json:"in_flight"`               // requests streaming right now
+	PinnedBy     []string             `json:"pinned_by,omitempty"`     // clients pinned to it
+	Sessions     int                  `json:"sessions,omitempty"`      // Claude Code sessions pinned to it
+	ModelCooling map[string]time.Time `json:"model_cooling,omitempty"` // models limited on their own -> until
+	Tokens       pool.TokenUsage      `json:"tokens"`
 }
 
 type UsageClient struct {
@@ -640,13 +688,7 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 		names[i] = a.Name
 	}
 	stats := s.sel.StatsSnapshot(names)
-	sticky := s.sel.StickySnapshot()
-	pinnedTo := map[string][]string{}
-	for key, acct := range sticky {
-		if _, client, ok := strings.Cut(key, "|"); ok && client != config.DashboardClientName {
-			pinnedTo[acct] = append(pinnedTo[acct], client)
-		}
-	}
+	pins := pinIndex(s.sel.StickySnapshot())
 	clientStats := s.sel.ClientStatsSnapshot()
 
 	for _, a := range accounts {
@@ -694,10 +736,9 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 			t := stt.CoolingUntil
 			row.CoolingUntil = &t
 		}
-		if p := pinnedTo[a.Name]; len(p) > 0 {
-			slices.Sort(p)
-			row.PinnedBy = p
-		}
+		row.PinnedBy = pins.clients(a.Name)
+		row.Sessions = pins.sessions[a.Name]
+		row.ModelCooling = stt.ModelCooling
 		out.Accounts = append(out.Accounts, row)
 	}
 	slices.SortFunc(out.Accounts, func(a, b UsageAccount) int { return strings.Compare(a.Name, b.Name) })
@@ -710,7 +751,7 @@ func (s *Server) serveUsageJSON(w http.ResponseWriter, st *State) {
 		row := UsageClient{
 			Name:     cca.Name,
 			Pool:     pn,
-			Pinned:   pinnedLabel(sticky[pn+"|"+cca.Name]),
+			Pinned:   pinnedLabel(pins.accounts(pn, cca.Name)),
 			Requests: clientStats[cca.Name].Requests,
 		}
 		if cs, ok := clientStats[cca.Name]; ok && !cs.LastSeen.IsZero() {
