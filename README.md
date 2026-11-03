@@ -12,9 +12,17 @@ only files it owns live under `~/.cproxy/` (or `$CPROXY_HOME`).
 
 A Claude conversation resends its full context on every request. If a proxy
 rotated credentials per request, every account in the pool would pay for the
-whole context. cproxy pins each client to **one** pool account and keeps it
-there, so a conversation is paid for once, on one subscription. Other
-strategies (`round-robin`, `least-used`, `random`) are available per pool.
+whole context. cproxy pins each conversation to **one** pool account and
+keeps it there, so a conversation is paid for once, on one subscription.
+Other strategies (`round-robin`, `least-used`, `random`) are available per
+pool.
+
+Pins are per Claude Code **session** (its `X-Claude-Code-Session-Id`
+header), so a new session can start on the
+account with the most headroom while running ones stay where their prompt
+cache is, and one session failing over does not move the others. A session
+idle for an hour (the longest prompt cache TTL, so nothing is lost) gives
+its pin up. Requests without a session id are pinned per client, as before.
 
 The pin moves **before** the account runs out, the way claude-swap's
 auto-switch does: once the account's binding window (the higher of its
@@ -30,14 +38,26 @@ Failover:
 
 - **429** — the client is retried on the next account, and the account cools
   down according to what the 429 says:
-  - the subscription is exhausted (`anthropic-ratelimit-unified-status:
-    rejected`): until `anthropic-ratelimit-unified-reset`;
+  - a shared 5-hour or 7-day window is spent (or the subscription is
+    rejected for no narrower reason): until the latest reset among the
+    rejected windows, up to 7 days, plus a few random seconds so a pool's
+    clients do not all return at the same instant;
+  - only one model's weekly limit (`7d_oi`) or extra usage is rejected
+    while the shared windows still have room: only **that model** cools
+    down on the account, which keeps serving other models. The
+    extra-usage billing-period end is not taken for a reset;
   - any other rate limit: `Retry-After`, else 30 seconds;
   - a bare 429 with no rate-limit headers at all: not at all. OAuth tokens
     get that for requests Anthropic refuses to serve on them (for example
     without Claude Code's system prompt), and the account keeps working.
+  - fast mode refused for want of usage credits: not at all, and no other
+    account is tried; the refusal goes straight back to Claude Code.
 - **401** — the account is marked invalid and excluded until the token
   changes on reload.
+- **403** — the request is retried on the next account. If another account
+  serves it, the refusing one (a disabled organization, a revoked grant)
+  is benched for 30 minutes; if every account refuses it, the request is
+  at fault and none is benched.
 - Transport errors — the account is benched briefly and another is tried
   (a client hanging up mid-request does not count against the account).
 
@@ -433,7 +453,8 @@ The local daemon and `cproxy serve` expose `/usage`:
   external scripts, and laid out as cards on phones. It shows headline tiles
   (accounts, requests and how many are streaming now, tokens, 429s,
   clients), then each account with its email and plan, state, which clients
-  are pinned to it, 5-hour / 7-day / per-model / extra-usage meters, requests
+  and how many sessions are pinned to it, models cooling down on it alone,
+  5-hour / 7-day / per-model / extra-usage meters, requests
   and tokens, and each client with its pool, pinned account, tokens and
   whether it is streaming. Accounts without
   usage API access get their 5-hour / 7-day meters from the last response's

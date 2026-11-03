@@ -499,7 +499,7 @@ func TestUsageProbeForTokensWithoutProfileScope(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	// busy serves a request, so its windows are fresh from the headers.
-	srv.sel.Pin(config.DefaultPoolName, "alice", "busy")
+	srv.sel.Pin(pool.Route{Pool: config.DefaultPoolName, Client: "alice"}, "busy")
 	doReq(t, "POST", ts.URL+"/v1/messages", bearerHeaders("cp_alice"), "{}")
 
 	ctx := context.Background()

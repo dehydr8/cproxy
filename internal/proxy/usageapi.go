@@ -135,7 +135,7 @@ func oauthGet(ctx context.Context, client *http.Client, upstream *url.URL, token
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return &usageAPIError{status: resp.StatusCode, retryAfter: time.Until(retryAfter(resp, 0))}
+		return &usageAPIError{status: resp.StatusCode, retryAfter: time.Until(retryAfter(resp.Header, time.Now(), 0))}
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out); err != nil {
 		return fmt.Errorf("decoding response: %w", err)

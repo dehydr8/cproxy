@@ -238,8 +238,24 @@ func renderUsage(out io.Writer, snap proxy.UsageSnapshot, where string, now time
 		state := p.state(a, now)
 		if len(a.PinnedBy) > 0 {
 			state += p.dim(" · for " + strings.Join(a.PinnedBy, ", "))
+			switch {
+			case a.Sessions == 1:
+				state += p.dim(" (1 session)")
+			case a.Sessions > 1:
+				state += p.dim(" (" + strconv.Itoa(a.Sessions) + " sessions)")
+			}
 		}
 		fmt.Fprintln(&b, "  "+state)
+		models := make([]string, 0, len(a.ModelCooling))
+		for model, until := range a.ModelCooling {
+			if until.After(now) {
+				models = append(models, model)
+			}
+		}
+		sort.Strings(models)
+		for _, model := range models {
+			fmt.Fprintln(&b, "  "+p.amber(model+" cooling "+humanDur(a.ModelCooling[model].Sub(now))))
+		}
 
 		meters := accountMeters(a, now)
 		for _, m := range meters {
